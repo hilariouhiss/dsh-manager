@@ -282,19 +282,29 @@ pub const FAILURE_CONTEXT_LINES: usize = 20;
 /// 启动宽限窗口：进程在这段时间内退出即判为启动失败。
 pub const STARTUP_GRACE: std::time::Duration = std::time::Duration::from_millis(800);
 
-/// 由退出码与最后的输出判定启动失败属于哪一类（FR-3.6）。
-pub fn classify_start_failure(lines: &[String], exit_code: i32) -> AppError {
-    let tail: Vec<&str> = lines
+/// 最后的若干行输出。分类与进程退出后的复核必须用**同一份**尾行，否则 code 与 raw 会漂移。
+fn failure_tail(lines: &[String]) -> String {
+    lines
         .iter()
         .rev()
         .take(FAILURE_CONTEXT_LINES)
         .rev()
         .map(String::as_str)
-        .collect();
-    let raw = tail.join("\n");
-    let joined = lines.join("\n").to_ascii_lowercase();
+        .collect::<Vec<_>>()
+        .join("\n")
+}
 
-    if PORT_IN_USE_PATTERNS.iter().any(|p| joined.contains(p)) {
+/// 尾行是否带端口占用特征（大小写不敏感）。
+fn matches_port_in_use(tail: &str) -> bool {
+    let tail = tail.to_ascii_lowercase();
+    PORT_IN_USE_PATTERNS.iter().any(|p| tail.contains(p))
+}
+
+/// 由退出码与最后的输出判定启动失败属于哪一类（FR-3.6）。
+pub fn classify_start_failure(lines: &[String], exit_code: i32) -> AppError {
+    let raw = failure_tail(lines);
+
+    if matches_port_in_use(&raw) {
         AppError::new(
             crate::error::INSTANCE_PORT_IN_USE,
             format!("启动失败：DSH 报告端口被占用（退出码 {exit_code}）"),
@@ -343,6 +353,29 @@ impl InstanceEntry {
                 .expect("受管登记锁被毒化")
                 .unregister(self.pid, &self.instance_id);
         }
+    }
+
+    /// 用终态收尾：只有仍在运行/启动中的登记项才允许改成 stopped/failed，返回是否改成功。
+    ///
+    /// 进程退出后的失败复核与并发停止可能同时到达：先到者定论，
+    /// 失败不会被 stopped 覆盖，操作记录也不会重复写（FR-3.6 的输出触发）。
+    fn finish(&self, state: InstanceState) -> bool {
+        let changed = {
+            let mut current = self.state.lock().expect("状态锁被毒化");
+            if matches!(*current, InstanceState::Stopped | InstanceState::Failed) {
+                false
+            } else {
+                *current = state;
+                true
+            }
+        };
+        if changed {
+            self.managed
+                .lock()
+                .expect("受管登记锁被毒化")
+                .unregister(self.pid, &self.instance_id);
+        }
+        changed
     }
 
     /// 一行输出的整条管线：取号、落盘与推送都在同一把行锁内完成。
@@ -421,9 +454,16 @@ impl ManagedRegistry {
     }
 }
 
+/// 进程退出后按输出尾行判定为失败时要写的那条操作记录（FR-3.6）。
+///
+/// 真实装配点写 oplog 并推 `oplog:entry` 事件；测试注入一个记录器即可断言，不依赖 Tauri。
+pub type FailureRecorder = Arc<dyn Fn(&crate::m0::oplog::OplogEntry) + Send + Sync>;
+
 /// 本工具启动过的实例登记表 + M3 的事件出口。
 pub struct InstanceRunner {
     emitter: Arc<dyn InstanceEmitter>,
+    /// 未注入时失败只体现在状态事件里（单测默认）。
+    failure_recorder: Option<FailureRecorder>,
     entries: Mutex<std::collections::HashMap<String, Arc<InstanceEntry>>>,
     managed: Arc<Mutex<ManagedRegistry>>,
 }
@@ -433,9 +473,21 @@ impl InstanceRunner {
     pub fn new(emitter: Arc<dyn InstanceEmitter>) -> Self {
         Self {
             emitter,
+            failure_recorder: None,
             entries: Mutex::new(std::collections::HashMap::new()),
             managed: Arc::new(Mutex::new(ManagedRegistry::default())),
         }
+    }
+
+    /// 装配点注入操作记录出口：进程退出后判定为启动失败时要留一条 oplog。
+    pub fn with_failure_recorder(mut self, recorder: FailureRecorder) -> Self {
+        self.failure_recorder = Some(recorder);
+        self
+    }
+
+    /// 监督任务用它写失败操作记录。
+    fn failure_recorder(&self) -> Option<FailureRecorder> {
+        self.failure_recorder.clone()
     }
 
     /// 受管登记表的共享句柄：装配点把它交给 `ProcessLister`，让实例枚举能识别本工具实例。
@@ -666,15 +718,54 @@ pub async fn start(
         .emitter()
         .emit_state(state_payload(&entry, InstanceState::Running));
 
-    // 监督任务：进程退出后先等两个读者读到 EOF，再推 stopped，否则最后几行会在 stopped 之后才到。
-    // **登记项保留**，这样停止之后仍能读输出与导出日志；受管登记则由 set_state 摘除。
+    // 监督任务：进程退出后先等两个读者读到 EOF，再推终态，否则最后几行会在终态之后才到。
+    // **登记项保留**，这样停止之后仍能读输出与导出日志；受管登记则由终态摘除。
     let supervised = entry.clone();
     let emitter = runner.emitter();
+    let recorder = runner.failure_recorder();
     tokio::spawn(async move {
-        let _ = child.wait().await;
+        let exit_code = child
+            .wait()
+            .await
+            .ok()
+            .and_then(|status| status.code())
+            .unwrap_or(-1);
         drain_streams(stdout_task, stderr_task, &supervised).await;
-        supervised.set_state(InstanceState::Stopped);
-        emitter.emit_state(state_payload(&supervised, InstanceState::Stopped));
+
+        // FR-3.6 的输出触发不限于 800ms 宽限窗口：真实 DSH 的 EADDRINUSE 出现在插件激活阶段
+        // （实测约 19.5s）。进程退出后按**最后若干行**复核，命中就落成 failed 而不是 stopped。
+        let lines: Vec<String> = supervised
+            .buffer
+            .lock()
+            .expect("输出缓冲锁被毒化")
+            .snapshot()
+            .into_iter()
+            .map(|line| line.text)
+            .collect();
+        let tail = failure_tail(&lines);
+        let failed = matches_port_in_use(&tail);
+        let state = if failed {
+            InstanceState::Failed
+        } else {
+            InstanceState::Stopped
+        };
+
+        // 先礼的停止可能与退出同时收尾：终态只认第一次，失败不被 stopped 覆盖，记录只写一次。
+        if !supervised.finish(state) {
+            return;
+        }
+        emitter.emit_state(state_payload(&supervised, state));
+
+        if failed && let Some(record) = recorder {
+            // 与启动宽限窗口内的归类复用同一份尾行：code 与 raw 不会漂移。
+            let err = classify_start_failure(&lines, exit_code);
+            record(&crate::m0::oplog::OplogEntry::fail(
+                "instance.start",
+                &supervised.instance_id,
+                &err.code,
+                tail,
+            ));
+        }
     });
 
     Ok(entry.instance_id.clone())
@@ -839,6 +930,35 @@ mod tests {
     fn recording_runner() -> (Arc<InstanceRunner>, Arc<RecordingEmitter>) {
         let emitter = Arc::new(RecordingEmitter::default());
         (Arc::new(InstanceRunner::new(emitter.clone())), emitter)
+    }
+
+    /// 记录型操作记录出口：让「进程退出后按输出尾行判定失败」在不依赖 Tauri 的情况下可断言。
+    #[derive(Default)]
+    struct RecordingRecorder {
+        entries: Mutex<Vec<crate::m0::oplog::OplogEntry>>,
+    }
+
+    impl RecordingRecorder {
+        fn entries(&self) -> Vec<crate::m0::oplog::OplogEntry> {
+            self.entries.lock().unwrap().clone()
+        }
+    }
+
+    /// 同上，但额外注入一个可读的操作记录出口。
+    fn recording_runner_with_oplog() -> (
+        Arc<InstanceRunner>,
+        Arc<RecordingEmitter>,
+        Arc<RecordingRecorder>,
+    ) {
+        let emitter = Arc::new(RecordingEmitter::default());
+        let recorder = Arc::new(RecordingRecorder::default());
+        let sink = recorder.clone();
+        let runner = InstanceRunner::new(emitter.clone()).with_failure_recorder(Arc::new(
+            move |entry: &crate::m0::oplog::OplogEntry| {
+                sink.entries.lock().unwrap().push(entry.clone())
+            },
+        ));
+        (Arc::new(runner), emitter, recorder)
     }
 
     /// 这些用例要真跑 node，**默认忽略**，在验收步骤里用 --ignored 显式运行。
@@ -1861,6 +1981,92 @@ mod tests {
         );
     }
 
+    /// 端口特征只认**最后若干行**：很早以前出现过的旧错误不能把一次无关的退出归成端口占用
+    /// （分类与进程退出后的复核必须用同一份尾行）。
+    #[test]
+    fn port_in_use_patterns_are_matched_only_in_the_tail() {
+        let mut lines =
+            vec!["Error: listen EADDRINUSE: address already in use 127.0.0.1:3080".to_string()];
+        lines.extend((0..FAILURE_CONTEXT_LINES).map(|i| format!("later-{i}")));
+
+        let err = classify_start_failure(&lines, 1);
+
+        assert_eq!(err.code, crate::error::INSTANCE_EXITED_IMMEDIATELY);
+        assert!(
+            !err.raw.unwrap_or_default().contains("EADDRINUSE"),
+            "错误上下文只回带尾行，不该包含太早的那一行"
+        );
+    }
+
+    /// FR-3.6 的输出触发不限于 800ms 宽限窗口：真实 DSH 的 EADDRINUSE 出现在插件激活阶段
+    /// （约 19.5s）。这里用真子进程在窗口之后打印端口占用并退出，断言它被落成 failed，
+    /// 并留下**恰好一条** `instance.port_in_use` 操作记录（raw = 尾行）。
+    #[tokio::test]
+    async fn port_in_use_after_the_grace_window_is_reported_as_failure() {
+        let dir = temp_dir("late-port-in-use");
+        let (runner, emitter, recorder) = recording_runner_with_oplog();
+        let probe = FakeProbe::new(Vec::new());
+        // ping 约 1 秒：进程活过 800ms 宽限窗口，之后才打印端口占用并以 1 退出。
+        let spec = build_start_spec(
+            Path::new("cmd.exe"),
+            &[
+                "/C".to_string(),
+                "ping -n 2 127.0.0.1 > nul & echo Error: listen EADDRINUSE: address already in use 127.0.0.1:3080 & exit /b 1"
+                    .to_string(),
+            ],
+            &dir,
+            "inst-late",
+            100,
+            &dir.join("late.log"),
+            1024,
+            1,
+        );
+
+        let id = start(&runner, &probe, spec)
+            .await
+            .expect("800ms 宽限窗口内进程仍活着，start 必须成功");
+        assert_eq!(id, "inst-late");
+
+        let entry = runner.get("inst-late").expect("实例必须保留在登记表里");
+        let began = Instant::now();
+        loop {
+            let recorded = recorder.entries();
+            if entry.state() == InstanceState::Failed && !recorded.is_empty() {
+                break;
+            }
+            assert!(
+                began.elapsed() < Duration::from_secs(10),
+                "进程退出后必须判成 failed 并记一条操作记录：state={:?} entries={recorded:?}",
+                entry.state()
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        assert!(
+            emitter
+                .states()
+                .iter()
+                .any(|s| s.instance_id == "inst-late" && s.state == InstanceState::Failed),
+            "必须推送 instance:state failed：{:?}",
+            emitter.states()
+        );
+
+        let entries = recorder.entries();
+        assert_eq!(entries.len(), 1, "恰好一条失败操作记录：{entries:?}");
+        assert_eq!(
+            entries[0].code.as_deref(),
+            Some(crate::error::INSTANCE_PORT_IN_USE)
+        );
+        assert_eq!(entries[0].result, crate::m0::oplog::OplogResult::Fail);
+        assert_eq!(entries[0].action, "instance.start");
+        let raw = entries[0].raw.as_deref().unwrap_or_default();
+        assert!(
+            raw.contains("EADDRINUSE"),
+            "raw 必须是最后若干行输出（尾行）：{raw}"
+        );
+        assert_eq!(raw.lines().count(), 1, "尾行就是那一行输出：{raw}");
+    }
+
     /// FR-3.6：启动宽限窗口是 800ms（Lead 裁定 1），不是随手一个数字。
     #[test]
     fn startup_grace_window_is_800ms() {
@@ -2049,6 +2255,42 @@ mod tests {
 
         assert_eq!(stopped, vec!["inst-stuck".to_string()]);
         assert_eq!(kill.calls(), vec![(8001, true)], "这一步才允许带 /F");
+    }
+
+    /// IMPORTANT：点了「强制终止」但仍有残留时，绝不能当成停干净了直接退出；
+    /// 剩余实例必须原样带回「保留运行并退出」的收尾（存档 + 失败操作记录）。
+    #[tokio::test]
+    async fn forced_stop_leftovers_fall_back_to_the_keep_path() {
+        let (runner, _emitter) = recording_runner();
+        registered(&runner, 8001, "inst-stuck");
+        let kill = TaskKill::recording();
+        let pending = vec![UnstoppableInstance {
+            instance_id: "inst-stuck".to_string(),
+            pid: 8001,
+        }];
+
+        // /F 发出后进程树仍有存活：stop 返回 stopped=false，不得算作已停止。
+        let stubborn = FakeProbe::new(vec![web_proc(8001)]).with_alive(vec![8001]);
+        let stopped = force_stop_pending(&runner, &stubborn, &kill, &pending).await;
+
+        assert_eq!(kill.calls(), vec![(8001, true)], "这一步才允许带 /F");
+        assert!(stopped.is_empty(), "仍有残留时不得把实例算进「已停止」");
+
+        let leftovers = remaining_after_force(&pending, &stopped);
+        assert_eq!(leftovers, pending, "剩余实例必须原样带回 keep 路径");
+
+        let entry = forced_stop_failed_oplog_entry(&leftovers);
+        assert_eq!(entry.action, "instance.force_stop");
+        assert_eq!(entry.result, crate::m0::oplog::OplogResult::Fail);
+        assert_eq!(
+            entry.code.as_deref(),
+            Some(crate::error::INSTANCE_STOP_TIMEOUT)
+        );
+        assert!(
+            entry.target.contains("inst-stuck") && entry.target.contains("8001"),
+            "操作记录要如实带实例标识与 pid：{}",
+            entry.target
+        );
     }
 
     /// 三选一确认框的返回值映射。默认按钮是「强制终止」，但**必须由用户点**。
@@ -2336,10 +2578,12 @@ pub async fn stop(
 
     let stopped = residual_pids.is_empty();
     if stopped && let Some(entry) = runner.get(&req.instance_id) {
-        entry.set_state(InstanceState::Stopped);
-        runner
-            .emitter()
-            .emit_state(state_payload(&entry, InstanceState::Stopped));
+        // 与「进程退出后的失败复核」共用同一条收尾路径：先到者定论，不重复推事件。
+        if entry.finish(InstanceState::Stopped) {
+            runner
+                .emitter()
+                .emit_state(state_payload(&entry, InstanceState::Stopped));
+        }
     }
 
     Ok(StopResult {
@@ -2418,6 +2662,36 @@ pub fn describe_instances(pending: &[UnstoppableInstance]) -> String {
 /// 选「保留运行并退出」时如实写进操作记录的那一条（§3.9 第 4 步、Lead 裁定 3）。
 pub fn keep_running_oplog_entry(pending: &[UnstoppableInstance]) -> crate::m0::oplog::OplogEntry {
     crate::m0::oplog::OplogEntry::ok("instance.keep_running", &describe_instances(pending))
+}
+
+/// 用户点了「强制终止」之后仍有残留：从「已停止」名单里剔除后剩下的实例。
+///
+/// 退出分支用它把失败的强制回落到「保留运行并退出」的收尾，绝不把孤儿实例当成已停止。
+pub fn remaining_after_force(
+    pending: &[UnstoppableInstance],
+    stopped: &[String],
+) -> Vec<UnstoppableInstance> {
+    pending
+        .iter()
+        .filter(|item| !stopped.contains(&item.instance_id))
+        .cloned()
+        .collect()
+}
+
+/// 强制终止没停下、按「保留运行并退出」收尾时记的那一条失败操作记录（§3.9 第 3、4 步）。
+pub fn forced_stop_failed_oplog_entry(
+    leftovers: &[UnstoppableInstance],
+) -> crate::m0::oplog::OplogEntry {
+    crate::m0::oplog::OplogEntry::fail(
+        "instance.force_stop",
+        &describe_instances(leftovers),
+        crate::error::INSTANCE_STOP_TIMEOUT,
+        leftovers
+            .iter()
+            .map(|item| item.pid.to_string())
+            .collect::<Vec<_>>()
+            .join("、"),
+    )
 }
 
 /// 退出流程第 1 步：对每个本工具实例做**不带 /F** 的停止，然后如实汇报走向。

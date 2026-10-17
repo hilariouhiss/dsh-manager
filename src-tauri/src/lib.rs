@@ -304,13 +304,44 @@ pub fn run() {
                         match instance_runner::map_exit_choice(&ask_force_or_keep(&app, &pending)) {
                             instance_runner::ExitChoice::Force => {
                                 // 用户点了才允许补 /F（§3.9 第 3 步）。
-                                let _ = instance_runner::force_stop_pending(
+                                let stopped = instance_runner::force_stop_pending(
                                     runner.as_ref(),
                                     probe.as_ref(),
                                     &kill,
                                     &pending,
                                 )
                                 .await;
+                                // /F 也可能停不下来：剩下的实例必须按「保留运行并退出」收尾，
+                                // 否则应用退出后它就成了没有存档、没有操作记录的孤儿。
+                                let leftovers =
+                                    instance_runner::remaining_after_force(&pending, &stopped);
+                                if !leftovers.is_empty() {
+                                    log::error!(
+                                        "强制终止后仍有实例未停止，按「保留运行并退出」处理：{}",
+                                        instance_runner::describe_instances(&leftovers)
+                                    );
+                                    let entry =
+                                        instance_runner::forced_stop_failed_oplog_entry(&leftovers);
+                                    if let Err(e) = oplog.append(&entry, policy) {
+                                        log::warn!(
+                                            "记录「强制终止失败」的操作记录失败：{}：{}",
+                                            e.code,
+                                            e.reason
+                                        );
+                                    } else {
+                                        ipc::emit_oplog(&app, &entry);
+                                    }
+                                    if let Err(e) = instance_runner::remember_skipped_instances(
+                                        &marker,
+                                        &leftovers,
+                                    ) {
+                                        log::warn!(
+                                            "写下次启动提示的存档失败：{}：{}",
+                                            e.code,
+                                            e.reason
+                                        );
+                                    }
+                                }
                                 app.exit(0);
                             }
                             instance_runner::ExitChoice::KeepAndExit => {
@@ -356,15 +387,17 @@ pub fn run() {
             paths
                 .ensure_dirs()
                 .map_err(|e| format!("{}：{}", e.code, e.reason))?;
-            let settings = SettingsStore::load_or_init(paths.settings_file())
-                .map_err(|e| format!("{}：{}", e.code, e.reason))?;
-            let oplog = Oplog::new(paths.oplog_file());
+            let settings = Arc::new(
+                SettingsStore::load_or_init(paths.settings_file())
+                    .map_err(|e| format!("{}：{}", e.code, e.reason))?,
+            );
+            let oplog = Arc::new(Oplog::new(paths.oplog_file()));
 
             // 设置损坏：回落默认值 + 记一条操作记录 + 推事件，不阻断启动（§3.7、NFR-7）
             if let Some(raw) = settings.startup_problem() {
                 log::warn!("设置文件存在问题，已回落默认值：{raw}");
                 let entry = settings::record_corrupt(
-                    &oplog,
+                    oplog.as_ref(),
                     settings.file(),
                     raw,
                     logging::oplog_policy(&settings.snapshot()),
@@ -379,17 +412,34 @@ pub fn run() {
                 OriginFacts::unidentified("来源识别尚未落地", None),
             )));
             let process_probe: Arc<dyn ProcessProbe> = Arc::new(SysinfoProbe::new());
-            let runner = Arc::new(InstanceRunner::new(Arc::new(TauriEmitter::new(
-                app.handle().clone(),
-            ))));
+            // FR-3.6 输出触发的操作记录出口：真实装配写 oplog 并推 oplog:entry 事件。
+            let runner = Arc::new(
+                InstanceRunner::new(Arc::new(TauriEmitter::new(app.handle().clone())))
+                    .with_failure_recorder({
+                        let oplog = oplog.clone();
+                        let settings = settings.clone();
+                        let handle = app.handle().clone();
+                        Arc::new(move |entry: &crate::m0::oplog::OplogEntry| {
+                            let policy = logging::oplog_policy(&settings.snapshot());
+                            match oplog.append(entry, policy) {
+                                Ok(()) => ipc::emit_oplog(&handle, entry),
+                                Err(e) => log::warn!(
+                                    "记录实例启动失败的操作记录失败：{}：{}",
+                                    e.code,
+                                    e.reason
+                                ),
+                            }
+                        })
+                    }),
+            );
             // lister 与 runner 共享同一份受管登记，实例枚举才能把 cmd.exe 外壳下的 node 认成本工具实例。
             let lister: Arc<dyn InstanceLister> = Arc::new(ProcessLister::new(
                 process_probe.clone(),
                 runner.managed_registry(),
             ));
             app.manage(AppState {
-                settings: Arc::new(settings),
-                oplog: Arc::new(oplog),
+                settings: settings.clone(),
+                oplog: oplog.clone(),
                 cancel: Arc::new(CancelRegistry::new()),
                 registry: Arc::new(NpmRegistry::from_net()),
                 package_manager: Arc::new(AllPackageManagers),
