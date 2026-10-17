@@ -56,3 +56,29 @@ export interface AppError {
   raw: string | null;
   retryable: boolean;
 }
+/** 启动行为（主计划 §3.7，FR-5.2），对应 Rust 的 m0::settings::AutostartMode。 */
+export type AutostartMode = "tray" | "window";
+
+/**
+ * 设置全表（主计划 §3.7，14 项）。字段名与 Rust 侧 #[serde(rename_all = "camelCase")]
+ * 序列化后的键完全一致。
+ */
+export interface Settings {
+  autoChannel: string | null;
+  autoInstall: boolean;
+  confirmBeforeInstall: boolean;
+  launchArgs: string[];
+  workDir: string;
+  autoOpenBrowser: boolean;
+  autoScroll: boolean;
+  outputBufferLines: number;
+  logMaxMiB: number;
+  logKeepFiles: number;
+  oplogMaxMiB: number;
+  oplogKeepFiles: number;
+  stopInstanceOnExit: boolean;
+  autostartMode: AutostartMode;
+}
+
+/** update_settings 的入参（主计划 §3.4 命令 12）。 */
+export type SettingsPatch = Partial<Settings>;
