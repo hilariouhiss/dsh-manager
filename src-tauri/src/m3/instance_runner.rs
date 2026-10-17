@@ -178,6 +178,9 @@ pub struct TaskKill {
 enum KillMode {
     Real,
     Record(Arc<Mutex<Vec<(u32, bool)>>>),
+    /// 只用于测试：模拟 taskkill 无法启动。
+    #[cfg(test)]
+    SpawnFail,
 }
 
 /// 系统 taskkill 的绝对路径；取不到 SystemRoot 时退回裸命令名让 CreateProcess 走 PATH。
@@ -201,10 +204,20 @@ impl TaskKill {
         }
     }
 
+    /// 只用于测试：taskkill 无法启动，用来钉死「先复核、后定论」的时序。
+    #[cfg(test)]
+    pub fn spawn_failing() -> Self {
+        Self {
+            mode: KillMode::SpawnFail,
+        }
+    }
+
     /// 已发出的终止调用，按时间顺序的 `(pid, force)`。真实实现返回空表。
     pub fn calls(&self) -> Vec<(u32, bool)> {
         match &self.mode {
             KillMode::Record(v) => v.lock().expect("记录锁被毒化").clone(),
+            #[cfg(test)]
+            KillMode::SpawnFail => Vec::new(),
             KillMode::Real => Vec::new(),
         }
     }
@@ -216,6 +229,17 @@ impl TaskKill {
         if let KillMode::Record(v) = &self.mode {
             v.lock().expect("记录锁被毒化").push((pid, force));
             return Ok(0);
+        }
+
+        #[cfg(test)]
+        if matches!(&self.mode, KillMode::SpawnFail) {
+            return Err(AppError::new(
+                crate::error::INSTANCE_STOP_TIMEOUT,
+                format!("无法执行 taskkill 终止进程 {pid}"),
+                "先在本机命令行执行 taskkill /? 确认该命令可用，然后重试。",
+            )
+            .with_raw("测试注入：taskkill 未能启动")
+            .retryable(true));
         }
 
         let mut args = vec!["/PID".to_string(), pid.to_string(), "/T".to_string()];
@@ -1271,6 +1295,11 @@ mod tests {
 
         assert_eq!(err.code, INSTANCE_NOT_MANAGED);
         assert!(
+            err.reason.contains("不是由本工具启动"),
+            "外部实例未确认时必须保留既有拒绝文案：{}",
+            err.reason
+        );
+        assert!(
             err.reason.contains("4242"),
             "文案要指明影响哪个实例：{}",
             err.reason
@@ -1496,8 +1525,157 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(err.code, INSTANCE_NOT_MANAGED);
+        assert!(!err.retryable, "找不到实例不是可重试错误");
+        assert!(
+            err.reason.contains("找不到实例 pid-9999（可能已退出）"),
+            "原因要如实说明可能已退出：{}",
+            err.reason
+        );
+        assert!(
+            err.next_step.contains("刷新运行实例列表后再试"),
+            "下一步要可操作：{}",
+            err.next_step
+        );
         assert!(kill.calls().is_empty());
         assert!(probe.snapshot_calls() >= 1, "必须先枚举确认目标是否存在");
+    }
+
+    /// 登记项在停止后保留（供读输出）：状态已落幕的 inst-* 再停一次必须零终止命令。
+    /// 旧 pid 可能已被系统复用，taskkill 它会误杀无关进程。
+    #[tokio::test]
+    async fn stopping_a_stopped_instance_makes_zero_kill_calls() {
+        let (runner, _emitter) = recording_runner();
+        let entry = registered(&runner, 9001, "inst-done");
+        entry.set_state(InstanceState::Stopped);
+        // 旧 pid 已被别的进程复用：确实有进程活着，但不是要停的实例。
+        let probe = FakeProbe::new(vec![web_proc(9001)]).with_alive(vec![9001]);
+        let kill = TaskKill::recording();
+
+        let err = stop(
+            &runner,
+            &probe,
+            &kill,
+            stop_req("inst-done", false, false),
+            SHORT,
+            SHORT,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.code, INSTANCE_NOT_MANAGED);
+        assert!(!err.retryable);
+        assert!(
+            err.reason.contains("找不到实例 inst-done（可能已退出）"),
+            "已停止的实例要如实说找不到：{}",
+            err.reason
+        );
+        assert!(
+            kill.calls().is_empty(),
+            "已停止的实例绝不允许再次发出终止命令：{:?}",
+            kill.calls()
+        );
+        assert!(probe.is_alive(9001), "拒绝路径不得影响复用了旧 pid 的进程");
+    }
+
+    /// 进程活着但不是 DSH Web：文案不得谎称「已不在运行」，且零终止命令。
+    #[tokio::test]
+    async fn live_pid_that_is_not_a_dsh_web_instance_is_reported_truthfully() {
+        let (runner, _emitter) = recording_runner();
+        let mut not_dsh = web_proc(9300);
+        not_dsh.cmdline = vec![r"C:\Windows\System32\notepad.exe".to_string()];
+        let probe = FakeProbe::new(vec![not_dsh]);
+        let kill = TaskKill::recording();
+
+        let err = stop(
+            &runner,
+            &probe,
+            &kill,
+            stop_req("pid-9300", false, true),
+            SHORT,
+            SHORT,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.code, INSTANCE_NOT_MANAGED);
+        assert!(!err.retryable);
+        assert!(
+            err.reason.contains("不是可识别的 DSH Web 实例"),
+            "要说明它不是可识别的 DSH Web 进程：{}",
+            err.reason
+        );
+        assert!(
+            !err.reason.contains("已不在运行"),
+            "进程还活着，不得说成没有运行：{}",
+            err.reason
+        );
+        assert!(kill.calls().is_empty(), "非 DSH 进程一次终止命令都不许发");
+    }
+
+    /// 终止命令无法启动时也必须先复核：树没了算成功，树还在才要求强制确认，复核失败才是 stop_timeout。
+    #[tokio::test]
+    async fn taskkill_spawn_failure_is_decided_by_the_recheck() {
+        let (runner, _emitter) = recording_runner();
+        registered(&runner, 9002, "inst-s6");
+        let kill = TaskKill::spawn_failing();
+
+        // 树还活着：不是 stop_timeout，而是要求单独确认强制终止。
+        let alive = FakeProbe::new(vec![web_proc(9002)]).with_alive(vec![9002]);
+        let err = stop(
+            &runner,
+            &alive,
+            &kill,
+            stop_req("inst-s6", false, false),
+            SHORT,
+            SHORT,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.code, INSTANCE_FORCED_STOP_REQUIRED,
+            "taskkill 起不来但树还在：结论应是要求强制确认"
+        );
+        assert!(
+            alive.snapshot_calls() >= 1,
+            "taskkill 起不来也必须做停止后复核"
+        );
+
+        // 复核本身失败：这才是 stop_timeout（可重试）。
+        let unreachable = FakeProbe::new(Vec::new())
+            .with_alive(Vec::new())
+            .failing_snapshot();
+        let err = stop(
+            &runner,
+            &unreachable,
+            &kill,
+            stop_req("inst-s6", false, false),
+            SHORT,
+            SHORT,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code, INSTANCE_STOP_TIMEOUT);
+        assert!(err.retryable, "instance.stop_timeout 是可重试错误（§3.2）");
+
+        // 树已经不在：复核为空即成功，不得因为 taskkill 起不来就报错。
+        let gone = FakeProbe::new(Vec::new()).with_alive(Vec::new());
+        let result = stop(
+            &runner,
+            &gone,
+            &kill,
+            stop_req("inst-s6", false, false),
+            SHORT,
+            SHORT,
+        )
+        .await
+        .unwrap();
+        assert!(result.stopped);
+        assert!(result.residual_pids.is_empty());
+        assert!(!result.forced);
+        assert!(
+            gone.snapshot_calls() >= 1,
+            "taskkill 起不来也必须做停止后复核"
+        );
     }
 }
 
@@ -1552,25 +1730,42 @@ enum StopTarget {
     External { pid: u32 },
 }
 
+/// 「找不到」的统一定论：标识不存在，或登记项已经落幕（stopped / failed）。
+fn not_found(instance_id: &str) -> AppError {
+    AppError::new(
+        crate::error::INSTANCE_NOT_MANAGED,
+        format!("找不到实例 {instance_id}（可能已退出）"),
+        "刷新运行实例列表后再试。",
+    )
+}
+
+/// 只有仍在运行的状态才允许发终止命令：停止后的登记项会保留旧 pid 供读输出，
+/// 一次迟到的停止会 taskkill 到被系统复用的无关进程。
+fn is_live_state(state: InstanceState) -> bool {
+    matches!(
+        state,
+        InstanceState::Starting | InstanceState::Running | InstanceState::Stopping
+    )
+}
+
 fn resolve_target(
     runner: &InstanceRunner,
     probe: &dyn crate::ports::process::ProcessProbe,
     instance_id: &str,
 ) -> CmdResult<StopTarget> {
     if let Some(entry) = runner.get(instance_id) {
-        return Ok(StopTarget::Managed { pid: entry.pid });
+        return if is_live_state(entry.state()) {
+            Ok(StopTarget::Managed { pid: entry.pid })
+        } else {
+            // 已停止/失败的登记项不会再发终止命令，如实说找不到这个运行中的实例。
+            Err(not_found(instance_id))
+        };
     }
 
     let pid: u32 = instance_id
         .strip_prefix("pid-")
         .and_then(|s| s.parse().ok())
-        .ok_or_else(|| {
-            AppError::new(
-                crate::error::INSTANCE_NOT_MANAGED,
-                format!("找不到实例 {instance_id}"),
-                "回到「运行实例」页刷新列表，确认实例标识后再试。",
-            )
-        })?;
+        .ok_or_else(|| not_found(instance_id))?;
 
     let listed = crate::m3::instance_discovery::discover(
         probe,
@@ -1578,14 +1773,17 @@ fn resolve_target(
         crate::m3::now_ms(),
     )?;
     if listed.iter().any(|i| i.pid == pid && !i.managed) {
-        Ok(StopTarget::External { pid })
-    } else {
-        Err(AppError::new(
-            crate::error::INSTANCE_NOT_MANAGED,
-            format!("实例 {instance_id} 已不在运行"),
-            "回到「运行实例」页刷新列表；如果它已经被停掉，界面会自动显示「未运行」。",
-        ))
+        return Ok(StopTarget::External { pid });
     }
+    if probe.is_alive(pid) {
+        // 进程活着但不在可停止的外部实例列表里：不能说「已不在运行」。
+        return Err(AppError::new(
+            crate::error::INSTANCE_NOT_MANAGED,
+            format!("进程 {pid} 仍存在，但它不是可识别的 DSH Web 实例"),
+            "刷新「运行实例」列表后再试；本工具只停止列表里的 DSH Web 实例。",
+        ));
+    }
+    Err(not_found(instance_id))
 }
 
 /// `root` 及其全部子孙里**仍存活**的 pid，升序。这就是 E2E-7 的「复核无残留」。
@@ -1659,10 +1857,17 @@ pub async fn stop(
     };
 
     // 先礼后兵：force == false 时**不带** /F。
-    let _ = kill.kill_tree(pid, req.force).await?;
+    // taskkill 起不来不等于停止失败：冻结边界是「复核做不了才报 stop_timeout」，
+    // 所以命令发不出去也要继续往下按复核结果定论（§3.9 T-I4 要点 6）。
+    let kill_failed = kill.kill_tree(pid, req.force).await.is_err();
 
+    // 终止命令没发出去就没有可等待的对象，直接看根进程是否还在。
     let wait = if req.force { force_wait } else { stop_wait };
-    let gone = wait_gone(probe, pid, wait).await;
+    let gone = if kill_failed {
+        !probe.is_alive(pid)
+    } else {
+        wait_gone(probe, pid, wait).await
+    };
 
     // 无论哪条路径，停止后**必须**再次枚举复核（E2E-7「无残留」）。
     // 复核本身做不了才是 instance.stop_timeout；可观测的残留是正常返回值（§3.9 T-I4 要点 6）。
@@ -1679,14 +1884,24 @@ pub async fn stop(
         .retryable(true)
     })?;
 
-    if !gone && !req.force {
-        return Err(AppError::new(
-            crate::error::INSTANCE_FORCED_STOP_REQUIRED,
+    // taskkill 没启动起来时停止命令根本没发出去，不能复用「等待时限内没有退出」的说法。
+    if (kill_failed && !residual_pids.is_empty()) || (!gone && !req.force) {
+        let reason = if kill_failed {
+            format!(
+                "实例 {} 仍在运行（仍有 {} 个进程存活），终止命令未能执行",
+                req.instance_id,
+                residual_pids.len()
+            )
+        } else {
             format!(
                 "实例 {} 在等待时限内没有退出（仍有 {} 个进程存活）",
                 req.instance_id,
                 residual_pids.len()
-            ),
+            )
+        };
+        return Err(AppError::new(
+            crate::error::INSTANCE_FORCED_STOP_REQUIRED,
+            reason,
             "它可能正在执行任务。确认要强制终止时，请单独确认「强制终止」——该操作可能丢失正在进行的任务。",
         ));
     }
