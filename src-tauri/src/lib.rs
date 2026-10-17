@@ -11,6 +11,8 @@ pub mod ports;
 use std::sync::Arc;
 
 use serde::Serialize;
+use tauri::menu::{MenuBuilder, MenuItemBuilder};
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{Emitter as _, Manager};
 use tauri_plugin_dialog::{
     DialogExt as _, MessageDialogButtons, MessageDialogKind, MessageDialogResult,
@@ -37,6 +39,14 @@ use crate::m4::autostart::AutostartPort;
 use crate::ports::package_manager::PackageManager;
 use crate::ports::process::ProcessProbe;
 use crate::ports::registry::RegistrySource;
+
+/// 主窗口的 label。tauri.conf.json 的窗口没写 label，默认就是 "main"。
+const MAIN_WINDOW: &str = "main";
+/// 托盘图标标识。
+const TRAY_ID: &str = "main-tray";
+/// 托盘菜单项标识。
+const MENU_OPEN_WINDOW: &str = "open-main-window";
+const MENU_QUIT: &str = "quit";
 
 /// 装配点托管的统一状态。**字段名与顺序按主计划 §3.3.2 冻结**，任何任务都不得改名、
 /// 不得增删已有字段；尚未落地的字段由各自产出任务按下列顺序追加：
@@ -265,6 +275,169 @@ fn ask_force_or_keep(
     }
 }
 
+/// 显示并聚焦主窗口；窗口不存在时什么都不做（它由 tauri.conf.json 创建）。
+fn show_main_window(app: &tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window(MAIN_WINDOW) {
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
+}
+
+/// 用户请求退出：按 stopInstanceOnExit 先停实例，必要时弹三选一，最后退出应用（§3.9）。
+fn request_exit(app: &tauri::AppHandle) {
+    // 先把句柄取出来，别让 State 借用跟着 app 进异步块。
+    let (runner, probe, oplog, marker, policy, stop_on_exit) = {
+        let state = app.state::<AppState>();
+        let settings = state.settings.snapshot();
+        (
+            state.runner.clone(),
+            state.process_probe.clone(),
+            state.oplog.clone(),
+            instance_runner::pending_exit_file(&state.paths.cache_file()),
+            logging::oplog_policy(&settings),
+            settings.stop_instance_on_exit,
+        )
+    };
+
+    // 没开这个设置、或本来就没有本工具实例：直接退出（FR-4.4）。
+    if !stop_on_exit || runner.running_ids().is_empty() {
+        app.exit(0);
+        return;
+    }
+
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        // TaskKill 无状态，现造一个即可（AppState 里没有这个字段，也不该有）。
+        let kill = instance_runner::TaskKill::real();
+        match instance_runner::try_stop_all_on_exit(runner.as_ref(), probe.as_ref(), &kill, true)
+            .await
+        {
+            // 第 2 步：停干净了（或本来无事可做）→ 直接退出。
+            instance_runner::ExitOutcome::NothingToDo
+            | instance_runner::ExitOutcome::AllStopped(_) => app.exit(0),
+
+            // 第 3 步：阻塞式三选一。默认按钮是「强制终止」，但**必须由用户点**。
+            instance_runner::ExitOutcome::NeedsDecision(pending) => {
+                match instance_runner::map_exit_choice(&ask_force_or_keep(&app, &pending)) {
+                    instance_runner::ExitChoice::Force => {
+                        // 用户点了才允许补 /F（§3.9 第 3 步）。
+                        let stopped = instance_runner::force_stop_pending(
+                            runner.as_ref(),
+                            probe.as_ref(),
+                            &kill,
+                            &pending,
+                        )
+                        .await;
+                        // /F 也可能停不下来：剩下的实例必须按「保留运行并退出」收尾，
+                        // 否则应用退出后它就成了没有存档、没有操作记录的孤儿。
+                        let leftovers = instance_runner::remaining_after_force(&pending, &stopped);
+                        if !leftovers.is_empty() {
+                            log::error!(
+                                "强制终止后仍有实例未停止，按「保留运行并退出」处理：{}",
+                                instance_runner::describe_instances(&leftovers)
+                            );
+                            let entry = instance_runner::forced_stop_failed_oplog_entry(&leftovers);
+                            if let Err(e) = oplog.append(&entry, policy) {
+                                log::warn!(
+                                    "记录「强制终止失败」的操作记录失败：{}：{}",
+                                    e.code,
+                                    e.reason
+                                );
+                            } else {
+                                ipc::emit_oplog(&app, &entry);
+                            }
+                            if let Err(e) =
+                                instance_runner::remember_skipped_instances(&marker, &leftovers)
+                            {
+                                log::warn!("写下次启动提示的存档失败：{}：{}", e.code, e.reason);
+                            }
+                        }
+                        app.exit(0);
+                    }
+                    instance_runner::ExitChoice::KeepAndExit => {
+                        // 第 4 步：如实记一条操作记录，并留下下次启动要提示的存档。
+                        let entry = instance_runner::keep_running_oplog_entry(&pending);
+                        if let Err(e) = oplog.append(&entry, policy) {
+                            log::warn!("记录「保留运行并退出」失败：{}：{}", e.code, e.reason);
+                        } else {
+                            ipc::emit_oplog(&app, &entry);
+                        }
+                        if let Err(e) =
+                            instance_runner::remember_skipped_instances(&marker, &pending)
+                        {
+                            log::warn!("写下次启动提示的存档失败：{}：{}", e.code, e.reason);
+                        }
+                        app.exit(0);
+                    }
+                    // 取消退出：什么都不做，窗口保持打开（prevent_close 已经生效）。
+                    instance_runner::ExitChoice::CancelExit => {}
+                }
+            }
+        }
+    });
+}
+
+/// 托盘图标与菜单（T-A2）：至少提供「打开主窗口」与「退出」。
+fn setup_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
+    let open = MenuItemBuilder::with_id(MENU_OPEN_WINDOW, "打开主窗口").build(app)?;
+    let quit = MenuItemBuilder::with_id(MENU_QUIT, "退出").build(app)?;
+    let menu = MenuBuilder::new(app).items(&[&open, &quit]).build()?;
+    let icon = app.default_window_icon().cloned().expect(
+        "构建时没有嵌入窗口图标：请检查 tauri.conf.json 的 bundle.icon 与 src-tauri/icons 目录",
+    );
+    TrayIconBuilder::with_id(TRAY_ID)
+        .icon(icon)
+        .tooltip("DSH 管理器")
+        .menu(&menu)
+        // 左键/双击直接打开主窗口，右键弹出菜单（T-A2：菜单是托盘的主入口）。
+        .show_menu_on_left_click(false)
+        .on_menu_event(|app, event| match event.id().as_ref() {
+            MENU_OPEN_WINDOW => show_main_window(app),
+            MENU_QUIT => request_exit(app),
+            _ => {}
+        })
+        .on_tray_icon_event(|tray, event| match event {
+            TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            }
+            | TrayIconEvent::DoubleClick {
+                button: MouseButton::Left,
+                ..
+            } => show_main_window(tray.app_handle()),
+            _ => {}
+        })
+        .build(app)?;
+    Ok(())
+}
+
+/// 读设置里的启动行为（§3.7 autostartMode）。走 §3.3.2 冻结的 AppState 与 SettingsStore::snapshot()。
+fn configured_autostart_mode(app: &tauri::AppHandle) -> m4::autostart::AutostartMode {
+    app.state::<crate::AppState>()
+        .settings
+        .snapshot()
+        .autostart_mode
+}
+
+/// 启动分支（T-A2、FR-5.2）：命令行开关优先，其余情况用设置里的启动行为。
+fn apply_startup_behavior(app: &tauri::AppHandle) {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let configured = configured_autostart_mode(app);
+    let behavior = m4::autostart::startup_behavior(&args, configured);
+    // 关闭主窗口时要区分「退到托盘」与「退出」，把本次启动的结论托管起来。
+    app.manage(behavior);
+    match behavior {
+        m4::autostart::StartupBehavior::Window => show_main_window(app),
+        m4::autostart::StartupBehavior::Tray => {
+            // 只驻留托盘：隐藏主窗口，托盘图标仍然可见（FR-5.2）
+            if let Some(window) = app.get_webview_window(MAIN_WINDOW) {
+                let _ = window.hide();
+            }
+        }
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -282,109 +455,17 @@ pub fn run() {
                 return;
             };
             let app = window.app_handle().clone();
-            // 先把句柄取出来，别让 State 借用跟着 app 进异步块。
-            let (runner, probe, oplog, marker, policy, stop_on_exit) = {
-                let state = app.state::<AppState>();
-                let settings = state.settings.snapshot();
-                (
-                    state.runner.clone(),
-                    state.process_probe.clone(),
-                    state.oplog.clone(),
-                    instance_runner::pending_exit_file(&state.paths.cache_file()),
-                    logging::oplog_policy(&settings),
-                    settings.stop_instance_on_exit,
-                )
-            };
-
-            // 没开这个设置、或本来就没有本工具实例：按默认行为直接关（FR-4.4）。
-            if !stop_on_exit || runner.running_ids().is_empty() {
+            // 本次启动决定常驻托盘时，关闭主窗口只是收回托盘，进程继续运行（T-A2、FR-5.2）。
+            if *app.state::<m4::autostart::StartupBehavior>()
+                == m4::autostart::StartupBehavior::Tray
+            {
+                api.prevent_close();
+                let _ = window.hide();
                 return;
             }
-
-            // 先拦住这次关闭，做完决定再真的退（§3.9「应用退出时的例外」）。
+            // --window 启动：沿用既有退出流程（FR-4.4、§3.9）。
             api.prevent_close();
-
-            tauri::async_runtime::spawn(async move {
-                // TaskKill 无状态，现造一个即可（AppState 里没有这个字段，也不该有）。
-                let kill = instance_runner::TaskKill::real();
-                match instance_runner::try_stop_all_on_exit(
-                    runner.as_ref(),
-                    probe.as_ref(),
-                    &kill,
-                    true,
-                )
-                .await
-                {
-                    // 第 2 步：停干净了（或本来无事可做）→ 直接退出。
-                    instance_runner::ExitOutcome::NothingToDo
-                    | instance_runner::ExitOutcome::AllStopped(_) => app.exit(0),
-
-                    // 第 3 步：阻塞式三选一。默认按钮是「强制终止」，但**必须由用户点**。
-                    instance_runner::ExitOutcome::NeedsDecision(pending) => {
-                        match instance_runner::map_exit_choice(&ask_force_or_keep(&app, &pending)) {
-                            instance_runner::ExitChoice::Force => {
-                                // 用户点了才允许补 /F（§3.9 第 3 步）。
-                                let stopped = instance_runner::force_stop_pending(
-                                    runner.as_ref(),
-                                    probe.as_ref(),
-                                    &kill,
-                                    &pending,
-                                )
-                                .await;
-                                // /F 也可能停不下来：剩下的实例必须按「保留运行并退出」收尾，
-                                // 否则应用退出后它就成了没有存档、没有操作记录的孤儿。
-                                let leftovers =
-                                    instance_runner::remaining_after_force(&pending, &stopped);
-                                if !leftovers.is_empty() {
-                                    log::error!(
-                                        "强制终止后仍有实例未停止，按「保留运行并退出」处理：{}",
-                                        instance_runner::describe_instances(&leftovers)
-                                    );
-                                    let entry =
-                                        instance_runner::forced_stop_failed_oplog_entry(&leftovers);
-                                    if let Err(e) = oplog.append(&entry, policy) {
-                                        log::warn!(
-                                            "记录「强制终止失败」的操作记录失败：{}：{}",
-                                            e.code,
-                                            e.reason
-                                        );
-                                    } else {
-                                        ipc::emit_oplog(&app, &entry);
-                                    }
-                                    if let Err(e) = instance_runner::remember_skipped_instances(
-                                        &marker,
-                                        &leftovers,
-                                    ) {
-                                        log::warn!(
-                                            "写下次启动提示的存档失败：{}：{}",
-                                            e.code,
-                                            e.reason
-                                        );
-                                    }
-                                }
-                                app.exit(0);
-                            }
-                            instance_runner::ExitChoice::KeepAndExit => {
-                                // 第 4 步：如实记一条操作记录，并留下下次启动要提示的存档。
-                                let entry = instance_runner::keep_running_oplog_entry(&pending);
-                                if let Err(e) = oplog.append(&entry, policy) {
-                                    log::warn!("记录「保留运行并退出」失败：{}：{}", e.code, e.reason);
-                                } else {
-                                    ipc::emit_oplog(&app, &entry);
-                                }
-                                if let Err(e) =
-                                    instance_runner::remember_skipped_instances(&marker, &pending)
-                                {
-                                    log::warn!("写下次启动提示的存档失败：{}：{}", e.code, e.reason);
-                                }
-                                app.exit(0);
-                            }
-                            // 取消退出：什么都不做，窗口保持打开（prevent_close 已经生效）。
-                            instance_runner::ExitChoice::CancelExit => {}
-                        }
-                    }
-                }
-            });
+            request_exit(&app);
         })
         .invoke_handler(tauri::generate_handler![
             ipc::get_settings,
@@ -475,6 +556,10 @@ pub fn run() {
                 )),
                 paths,
             });
+
+            // T-A2：先建托盘，再按启动参数决定窗口是显示还是收进托盘。
+            setup_tray(app.handle())?;
+            apply_startup_behavior(app.handle());
 
             // §3.9 第 4 步：上次退出时若选了「保留运行并退出」，这里如实提示一次并清掉存档。
             // 提示必须在后台线程里弹：blocking_show 不能阻塞主线程，而 setup 就跑在主线程上。

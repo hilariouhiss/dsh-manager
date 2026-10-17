@@ -16,6 +16,12 @@ pub const LOGIN_ENTRY_NAME: &str = "dsh-manager";
 /// 原因见本子计划 §0.2（插件的启动参数在注册时冻结，进程内换不掉）。
 pub const LOGIN_ENTRY_ARG: &str = "--autostart";
 
+/// 显式要求最小化到托盘（T-A2、FR-5.2）。
+pub const TRAY_ARG: &str = "--tray";
+
+/// 显式要求打开主窗口（T-A2、FR-5.2）。
+pub const WINDOW_ARG: &str = "--window";
+
 use serde::Serialize;
 
 use crate::error::CmdResult;
@@ -46,6 +52,32 @@ pub trait AutostartPort: Send + Sync {
     fn disable(&self) -> CmdResult<()>;
     /// 登录项的位置标识，仅用于界面展示；拿不到时为 None。
     fn entry_path(&self) -> Option<String>;
+}
+
+/// 启动时实际采取的行为（T-A2）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartupBehavior {
+    Tray,
+    Window,
+}
+
+/// 解析命令行开关，决定启动行为。纯函数：不读环境、不碰系统，可直接单测。
+///
+/// 规则（主计划 §5 T-A2）：
+/// 1. 出现 --window → 打开主窗口（显式覆盖设置）；
+/// 2. 否则出现 --tray → 只驻留托盘（显式覆盖设置）；
+/// 3. 其余（无参数、未知参数、登录项写的 --autostart）→ 用设置里的 autostartMode，默认 Tray。
+pub fn startup_behavior(args: &[String], configured: AutostartMode) -> StartupBehavior {
+    if args.iter().any(|a| a == WINDOW_ARG) {
+        StartupBehavior::Window
+    } else if args.iter().any(|a| a == TRAY_ARG) {
+        StartupBehavior::Tray
+    } else {
+        match configured {
+            AutostartMode::Tray => StartupBehavior::Tray,
+            AutostartMode::Window => StartupBehavior::Window,
+        }
+    }
 }
 
 /// 读取系统真实状态。**不读本地配置、不做缓存**：每调用一次就问一次系统。
@@ -379,5 +411,77 @@ mod tests {
         ));
         let err = set_state(&fake, false, AutostartMode::Tray).expect_err("移除失败时必须返回 Err");
         assert_eq!(err.code, "autostart.denied");
+    }
+
+    fn args(raw: &[&str]) -> Vec<String> {
+        raw.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// 契约用例：--tray → 最小化到托盘（显式覆盖设置）。
+    #[test]
+    fn startup_behavior_explicit_tray_wins() {
+        assert_eq!(
+            startup_behavior(&args(&["--tray"]), AutostartMode::Window),
+            StartupBehavior::Tray,
+            "显式 --tray 必须压过设置里的 window"
+        );
+    }
+
+    /// 契约用例：--window → 打开主窗口（显式覆盖设置）。
+    #[test]
+    fn startup_behavior_explicit_window_wins() {
+        assert_eq!(
+            startup_behavior(&args(&["--window"]), AutostartMode::Tray),
+            StartupBehavior::Window,
+            "显式 --window 必须压过设置里的 tray"
+        );
+    }
+
+    /// 契约用例：无参数 → 用设置里的启动行为；§3.7 的默认值是 tray（枚举本身没有 Default 实现）。
+    #[test]
+    fn startup_behavior_without_args_uses_configured_default_tray() {
+        assert_eq!(
+            startup_behavior(&args(&[]), AutostartMode::Tray),
+            StartupBehavior::Tray,
+            "无参数且设置为默认值时必须最小化到托盘（FR-5.2、§3.7）"
+        );
+    }
+
+    /// 无参数但设置里选了「打开主窗口」时，必须听设置的。
+    #[test]
+    fn startup_behavior_without_args_honours_configured_window() {
+        assert_eq!(
+            startup_behavior(&args(&[]), AutostartMode::Window),
+            StartupBehavior::Window
+        );
+    }
+
+    /// 契约用例：未知参数 → 默认 tray。
+    #[test]
+    fn startup_behavior_unknown_args_fall_back_to_tray() {
+        assert_eq!(
+            startup_behavior(&args(&["--whatever", "web"]), AutostartMode::Tray),
+            StartupBehavior::Tray,
+            "未知参数不得报错，一律回落到默认行为"
+        );
+    }
+
+    /// 登录项写进去的 --autostart 是未知参数，同样回落到设置。
+    #[test]
+    fn startup_behavior_login_entry_arg_falls_back_to_configured() {
+        assert_eq!(
+            startup_behavior(&args(&[LOGIN_ENTRY_ARG]), AutostartMode::Window),
+            StartupBehavior::Window,
+            "从登录项启动时，行为由 settings.autostartMode 决定"
+        );
+    }
+
+    /// 两个开关都给时，--window 优先（并集里取更强的那条，规则写在函数注释里）。
+    #[test]
+    fn startup_behavior_window_wins_over_tray() {
+        assert_eq!(
+            startup_behavior(&args(&["--tray", "--window"]), AutostartMode::Tray),
+            StartupBehavior::Window
+        );
     }
 }
