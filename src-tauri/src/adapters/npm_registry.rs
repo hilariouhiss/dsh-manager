@@ -193,15 +193,10 @@ impl RegistrySource for NpmRegistry {
             Ok(Err(e)) => return ChannelProbe::Failed(crate::m0::net::classify(e)),
             Ok(Ok(v)) => v,
         };
+        // 404 表示该包在注册表里没有发布记录 → 「尚未发布」，是正常返回值而非错误
+        // （主计划 §3.2：registry.http 只覆盖非 404 状态；T-S6 把 404 留给适配器判定）。
         if status == reqwest::StatusCode::NOT_FOUND {
-            return ChannelProbe::Failed(
-                AppError::new(
-                    crate::error::REGISTRY_HTTP,
-                    format!("包注册表里找不到 {PACKAGE_NAME}（HTTP 404）。"),
-                    "确认包名与注册表地址；若使用私有镜像，请检查镜像配置。",
-                )
-                .retryable(false),
-            );
+            return ChannelProbe::Unpublished;
         }
         if !status.is_success() {
             return ChannelProbe::Failed(
@@ -239,6 +234,16 @@ impl RegistrySource for NpmRegistry {
         progress: ProgressSink,
     ) -> CmdResult<()> {
         use std::io::Write as _;
+
+        // 已取消的令牌在出网前就直接返回：不建目录、不建文件、也不发请求。
+        if cancel.is_cancelled() {
+            return Err(AppError::new(
+                crate::error::DOWNLOAD_CANCELLED,
+                "下载已被取消。",
+                "需要时重新点击「安装」即可。",
+            )
+            .retryable(true));
+        }
 
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent).map_err(|e| {
@@ -350,6 +355,17 @@ mod tests {
 
     fn parse(s: &str) -> Packument {
         serde_json::from_str(s).expect("夹具 JSON 必须能解析")
+    }
+
+    /// 下载用例的版本记录：只有 tarball 地址随夹具服务器变。
+    fn release_for(tarball_url: &str) -> PackageRelease {
+        PackageRelease {
+            version: semver::Version::parse("0.2.0-rc.2").unwrap(),
+            published_at_iso: "2026-10-02T08:11:32.114Z".to_string(),
+            integrity: Some("sha512-abc".to_string()),
+            tarball_url: tarball_url.to_string(),
+            unpacked_size: Some(91756),
+        }
     }
 
     #[test]
@@ -594,5 +610,94 @@ mod tests {
         assert_eq!(e.code, crate::error::NETWORK_OFFLINE);
         assert_eq!(fake.probe_calls(), 3);
         assert_eq!(fake.log().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn not_found_is_unpublished_not_a_registry_http_error() {
+        // 主计划 §3.2：404 表示「尚未发布」，必须作为正常返回值；不得产生 registry.http/AppError。
+        let server = FixtureServer::start(404, "application/json", b"{}".to_vec());
+        let reg = NpmRegistry::with_base_url(
+            server.base_url(),
+            crate::m0::net::client().clone(),
+            Duration::from_secs(5),
+        );
+        assert!(matches!(
+            reg.probe("latest").await,
+            ChannelProbe::Unpublished
+        ));
+    }
+
+    #[tokio::test]
+    async fn download_writes_exact_bytes_and_reports_monotonic_progress_to_100_percent() {
+        const BODY: &[u8] = b"tarball-bytes-\x00\x01\x02-payload";
+        let server = FixtureServer::start(200, "application/octet-stream", BODY.to_vec());
+        let dir = crate::m0::paths::temp_root("npm-download-ok");
+        let dest = dir.join("pkg.tgz");
+        let release = release_for(&format!("{}/pkg.tgz", server.base_url()));
+        let reg = NpmRegistry::with_base_url(
+            server.base_url(),
+            crate::m0::net::client().clone(),
+            Duration::from_secs(5),
+        );
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = {
+            let seen = std::sync::Arc::clone(&seen);
+            ProgressSink::new(move |downloaded, total| {
+                seen.lock().unwrap().push((downloaded, total));
+            })
+        };
+        reg.download(
+            &release,
+            &dest,
+            crate::m0::cancel::CancelToken::new_for_test(),
+            sink,
+        )
+        .await
+        .expect("真实适配器下载必须成功");
+
+        assert_eq!(
+            std::fs::read(&dest).unwrap(),
+            BODY,
+            "落盘字节必须与响应体完全一致"
+        );
+        let reports = seen.lock().unwrap().clone();
+        assert!(!reports.is_empty(), "至少要上报一次进度");
+        let total = BODY.len() as u64;
+        assert!(
+            reports.iter().all(|(_, t)| *t == Some(total)),
+            "总字节数必须始终是响应体长度：{reports:?}"
+        );
+        for pair in reports.windows(2) {
+            assert!(pair[1].0 >= pair[0].0, "进度必须单调不减：{reports:?}");
+        }
+        assert_eq!(
+            reports.last().unwrap().0,
+            total,
+            "进度必须终止于 100%：{reports:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn download_with_a_pre_cancelled_token_fails_with_download_cancelled_and_no_file() {
+        let server =
+            FixtureServer::start(200, "application/octet-stream", b"never-written".to_vec());
+        let dir = crate::m0::paths::temp_root("npm-download-cancelled");
+        let dest = dir.join("pkg.tgz");
+        let release = release_for(&format!("{}/pkg.tgz", server.base_url()));
+        let reg = NpmRegistry::with_base_url(
+            server.base_url(),
+            crate::m0::net::client().clone(),
+            Duration::from_secs(5),
+        );
+        let token = crate::m0::cancel::CancelToken::new_for_test();
+        token.cancel();
+
+        let err = reg
+            .download(&release, &dest, token, ProgressSink::new(|_, _| {}))
+            .await
+            .expect_err("已取消的下载必须失败");
+        assert_eq!(err.code, crate::error::DOWNLOAD_CANCELLED);
+        assert!(err.retryable, "取消后允许用户重新点击安装");
+        assert!(!dest.exists(), "取消后不得留下目标文件");
     }
 }
