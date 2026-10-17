@@ -4,6 +4,7 @@ pub mod bun;
 pub mod npm;
 pub mod npm_registry;
 pub mod pnpm;
+pub mod sysinfo_probe;
 
 #[cfg(test)]
 pub mod fake;

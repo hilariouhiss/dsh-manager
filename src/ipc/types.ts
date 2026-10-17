@@ -154,3 +154,17 @@ export interface TaskProgressPayload {
   remainingMs: number | null;
   phase: InstallPhase;
 }
+
+/** 实例状态（主计划 §3.5 的 instance:state 取值，对应 Rust 的 m3::InstanceState）。 */
+export type InstanceState = "starting" | "running" | "stopping" | "stopped" | "failed";
+
+/** list_instances 的出参（主计划 §3.4 命令 6，对应 Rust 的 m3::instance_discovery::InstanceInfo）。 */
+export interface InstanceInfo {
+  instanceId: string;
+  managed: boolean;
+  pid: number;
+  startedAtMs: number | null;
+  uptimeMs: number | null;
+  url: string | null;
+  state: InstanceState;
+}

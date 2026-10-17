@@ -3,6 +3,7 @@ pub mod error;
 pub mod ipc;
 pub mod m0;
 pub mod m1;
+pub mod m3;
 pub mod ports;
 
 use std::sync::Arc;
@@ -11,13 +12,17 @@ use tauri::Manager;
 
 use crate::adapters::AllPackageManagers;
 use crate::adapters::npm_registry::NpmRegistry;
+use crate::adapters::sysinfo_probe::SysinfoProbe;
+use crate::error::CmdResult;
 use crate::m0::cancel::CancelRegistry;
 use crate::m0::logging;
 use crate::m0::oplog::Oplog;
 use crate::m0::paths::DataPaths;
 use crate::m0::settings::{self, SettingsStore};
 use crate::m1::version_check::{OriginFacts, SharedOriginFacts};
+use crate::m3::instance_discovery::{InstanceInfo, InstanceLister, ProcessLister};
 use crate::ports::package_manager::PackageManager;
+use crate::ports::process::ProcessProbe;
 use crate::ports::registry::RegistrySource;
 
 /// 装配点托管的统一状态。**字段名与顺序按主计划 §3.3.2 冻结**，任何任务都不得改名、
@@ -33,7 +38,16 @@ pub struct AppState {
     pub cancel: Arc<CancelRegistry>,
     pub registry: Arc<dyn RegistrySource>,
     pub package_manager: Arc<dyn PackageManager>,
+    pub process_probe: Arc<dyn ProcessProbe>,
+    pub lister: Arc<dyn InstanceLister>,
     pub paths: DataPaths,
+}
+
+/// §3.4 命令 6：列出当前运行的 DSH Web 形态实例（无实例时返回空数组，不报错）。
+/// 命令只认 InstanceLister 这个 trait，不认 M3 的实现类型——M1 的安装前检测也走同一个入口。
+#[tauri::command]
+fn list_instances(state: tauri::State<'_, AppState>) -> CmdResult<Vec<InstanceInfo>> {
+    state.lister.list_web_instances()
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -54,7 +68,8 @@ pub fn run() {
             ipc::check_updates,
             ipc::set_auto_channel,
             ipc::start_install,
-            ipc::cancel_task
+            ipc::cancel_task,
+            list_instances
         ])
         .setup(|app| {
             let paths = DataPaths::resolve(app.handle())
@@ -84,12 +99,17 @@ pub fn run() {
             app.manage(SharedOriginFacts::new(std::sync::RwLock::new(
                 OriginFacts::unidentified("来源识别尚未落地", None),
             )));
+            let process_probe: Arc<dyn ProcessProbe> = Arc::new(SysinfoProbe::new());
+            let lister: Arc<dyn InstanceLister> =
+                Arc::new(ProcessLister::new(process_probe.clone()));
             app.manage(AppState {
                 settings: Arc::new(settings),
                 oplog: Arc::new(oplog),
                 cancel: Arc::new(CancelRegistry::new()),
                 registry: Arc::new(NpmRegistry::from_net()),
                 package_manager: Arc::new(AllPackageManagers),
+                process_probe,
+                lister,
                 paths,
             });
             Ok(())
