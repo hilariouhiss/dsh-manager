@@ -15,6 +15,9 @@ use crate::m3::output_buffer::OutputBuffer;
 pub const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
 /// 不弹出控制台窗口。
 pub const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+/// 子进程退出后等待两个输出读者读到 EOF 的上限。超时只告警、仍然宣布 stopped：
+/// 卡死的子进程不能把实例状态永远留在 running（修复 3）。
+pub const OUTPUT_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// §3.5 `instance:state` 载荷。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -173,6 +176,10 @@ pub struct InstanceEntry {
     pub log_path: PathBuf,
     pub buffer: Arc<Mutex<OutputBuffer>>,
     state: Mutex<InstanceState>,
+    /// 两个管道读者共用的行锁：seq、时间戳、日志与事件必须同序（修复 2）。
+    line_lock: Mutex<()>,
+    /// 受管登记表的共享句柄：进程退出/停止时自动摘除，供实例枚举按祖先链匹配（修复 1）。
+    managed: Arc<Mutex<ManagedRegistry>>,
 }
 
 impl InstanceEntry {
@@ -182,6 +189,76 @@ impl InstanceEntry {
 
     pub fn set_state(&self, state: InstanceState) {
         *self.state.lock().expect("状态锁被毒化") = state;
+        // stopped/failed 之后枚举不得再把残留的 web 进程认成本工具实例。
+        if matches!(state, InstanceState::Stopped | InstanceState::Failed) {
+            self.managed
+                .lock()
+                .expect("受管登记锁被毒化")
+                .unregister(self.pid, &self.instance_id);
+        }
+    }
+
+    /// 一行输出的整条管线：取号、落盘与推送都在同一把行锁内完成。
+    fn record_line(
+        &self,
+        emitter: &dyn InstanceEmitter,
+        log: &Mutex<crate::m0::logging::LogWriter>,
+        text: String,
+        is_stderr: bool,
+    ) {
+        let _line = self.line_lock.lock().expect("行管线锁被毒化");
+        // 时间戳必须在锁内采样，才能与 seq 同序（stdout/stderr 两个读者并发）。
+        let timestamp_ms = crate::m3::now_ms();
+        let seq = self.buffer.lock().expect("输出缓冲锁被毒化").push(
+            timestamp_ms,
+            text.clone(),
+            is_stderr,
+        );
+        if let Ok(mut writer) = log.lock() {
+            // LogWriter::append_line 只收一个字符串：时间戳由我们拼进去（§0.4）。
+            let _ = writer.append_line(&format!("[{timestamp_ms}] {text}"));
+        }
+        // T-I3 的地址识别接在这里：从 text 里解析出 URL 后调用 emitter.emit_url(...)。
+        emitter.emit_output(InstanceOutputPayload {
+            instance_id: self.instance_id.clone(),
+            seq,
+            timestamp_ms,
+            text,
+            is_stderr,
+        });
+    }
+}
+
+/// 本工具已启动实例的登记记录。枚举看到的是 cmd.exe 外壳下的 node 进程，
+/// 所以匹配要按祖先链，而不是 spawn 出来的那个 pid（修复 1）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagedInstance {
+    pub pid: u32,
+    pub instance_id: String,
+    pub started_at_ms: i64,
+}
+
+/// 受管实例登记表。`ProcessLister` 与启动前的「已在运行」检查共用它；
+/// 它不反向持有 `InstanceRunner`，因此两者之间没有 `Arc` 环。
+#[derive(Debug, Default)]
+pub struct ManagedRegistry {
+    instances: Vec<ManagedInstance>,
+}
+
+impl ManagedRegistry {
+    /// 登记一次成功 spawn。crate 内可见，便于 lister 的测试直接喂数据。
+    pub(crate) fn register(&mut self, instance: ManagedInstance) {
+        self.unregister(instance.pid, &instance.instance_id);
+        self.instances.push(instance);
+    }
+
+    fn unregister(&mut self, pid: u32, instance_id: &str) {
+        self.instances
+            .retain(|i| i.pid != pid || i.instance_id != instance_id);
+    }
+
+    pub fn snapshot(&self) -> Vec<ManagedInstance> {
+        self.instances.clone()
     }
 }
 
@@ -189,6 +266,7 @@ impl InstanceEntry {
 pub struct InstanceRunner {
     emitter: Arc<dyn InstanceEmitter>,
     entries: Mutex<std::collections::HashMap<String, Arc<InstanceEntry>>>,
+    managed: Arc<Mutex<ManagedRegistry>>,
 }
 
 impl InstanceRunner {
@@ -197,7 +275,13 @@ impl InstanceRunner {
         Self {
             emitter,
             entries: Mutex::new(std::collections::HashMap::new()),
+            managed: Arc::new(Mutex::new(ManagedRegistry::default())),
         }
+    }
+
+    /// 受管登记表的共享句柄：装配点把它交给 `ProcessLister`，让实例枚举能识别本工具实例。
+    pub fn managed_registry(&self) -> Arc<Mutex<ManagedRegistry>> {
+        self.managed.clone()
     }
 
     /// 事件出口。两个读流任务与监督任务都用它推送。
@@ -214,6 +298,20 @@ impl InstanceRunner {
     }
 
     pub fn insert(&self, entry: Arc<InstanceEntry>) {
+        // 只有 start 成功后会走到这里：登记项即「本工具启动的实例」。
+        if matches!(
+            entry.state(),
+            InstanceState::Starting | InstanceState::Running | InstanceState::Stopping
+        ) {
+            self.managed
+                .lock()
+                .expect("受管登记锁被毒化")
+                .register(ManagedInstance {
+                    pid: entry.pid,
+                    instance_id: entry.instance_id.clone(),
+                    started_at_ms: entry.started_at_ms,
+                });
+        }
         self.entries
             .lock()
             .expect("登记表锁被毒化")
@@ -239,23 +337,9 @@ impl InstanceRunner {
         ids
     }
 
-    /// 供实例枚举标注 `managed` 用的 `(pid, instanceId)`。
-    pub fn managed_pids(&self) -> Vec<(u32, String)> {
-        let mut out: Vec<(u32, String)> = self
-            .entries
-            .lock()
-            .expect("登记表锁被毒化")
-            .values()
-            .filter(|e| {
-                matches!(
-                    e.state(),
-                    InstanceState::Starting | InstanceState::Running | InstanceState::Stopping
-                )
-            })
-            .map(|e| (e.pid, e.instance_id.clone()))
-            .collect();
-        out.sort_by_key(|(pid, _)| *pid);
-        out
+    /// 供实例枚举标注 `managed` 用的登记快照（pid、实例标识、启动时间）。
+    pub fn managed_pids(&self) -> Vec<ManagedInstance> {
+        self.managed.lock().expect("受管登记锁被毒化").snapshot()
     }
 }
 
@@ -277,24 +361,7 @@ async fn read_stream<R>(
     let mut lines = tokio::io::BufReader::new(reader).lines();
     // 管道在进程退出时断裂是正常现象，不是错误：循环自然结束。
     while let Ok(Some(text)) = lines.next_line().await {
-        let timestamp_ms = crate::m3::now_ms();
-        let seq = entry.buffer.lock().expect("输出缓冲锁被毒化").push(
-            timestamp_ms,
-            text.clone(),
-            is_stderr,
-        );
-        if let Ok(mut writer) = log.lock() {
-            // LogWriter::append_line 只收一个字符串：时间戳由我们拼进去（§0.4）。
-            let _ = writer.append_line(&format!("[{timestamp_ms}] {text}"));
-        }
-        // T-I3 的地址识别接在这里：从 text 里解析出 URL 后调用 emitter.emit_url(...)。
-        emitter.emit_output(InstanceOutputPayload {
-            instance_id: entry.instance_id.clone(),
-            seq,
-            timestamp_ms,
-            text,
-            is_stderr,
-        });
+        entry.record_line(emitter.as_ref(), log.as_ref(), text, is_stderr);
     }
 }
 
@@ -383,17 +450,19 @@ pub async fn start(
         log_path: spec.log_path.clone(),
         buffer,
         state: Mutex::new(InstanceState::Starting),
+        line_lock: Mutex::new(()),
+        managed: runner.managed_registry(),
     });
     runner.insert(entry.clone());
 
-    tokio::spawn(read_stream(
+    let stdout_task = tokio::spawn(read_stream(
         stdout,
         false,
         entry.clone(),
         runner.clone(),
         log.clone(),
     ));
-    tokio::spawn(read_stream(
+    let stderr_task = tokio::spawn(read_stream(
         stderr,
         true,
         entry.clone(),
@@ -409,11 +478,26 @@ pub async fn start(
         .emitter()
         .emit_state(state_payload(&entry, InstanceState::Running));
 
-    // 监督任务：进程退出后把状态推成 stopped。**登记项保留**，这样停止之后仍能读输出与导出日志。
+    // 监督任务：进程退出后先等两个读者读到 EOF，再推 stopped，否则最后几行会在 stopped 之后才到。
+    // **登记项保留**，这样停止之后仍能读输出与导出日志；受管登记则由 set_state 摘除。
     let supervised = entry.clone();
     let emitter = runner.emitter();
     tokio::spawn(async move {
         let _ = child.wait().await;
+        let drain = async {
+            let _ = stdout_task.await;
+            let _ = stderr_task.await;
+        };
+        if tokio::time::timeout(OUTPUT_DRAIN_TIMEOUT, drain)
+            .await
+            .is_err()
+        {
+            log::warn!(
+                "实例 {} 的进程已退出，但输出管道在 {:?} 内未读到 EOF；仍宣布 stopped",
+                supervised.instance_id,
+                OUTPUT_DRAIN_TIMEOUT
+            );
+        }
         supervised.set_state(InstanceState::Stopped);
         emitter.emit_state(state_payload(&supervised, InstanceState::Stopped));
     });
@@ -529,6 +613,10 @@ mod tests {
         fn outputs(&self) -> Vec<InstanceOutputPayload> {
             self.output.lock().unwrap().clone()
         }
+
+        fn states(&self) -> Vec<InstanceStatePayload> {
+            self.state.lock().unwrap().clone()
+        }
     }
 
     impl InstanceEmitter for RecordingEmitter {
@@ -615,19 +703,24 @@ mod tests {
             at < Duration::from_millis(1000),
             "第一行输出在 {at:?} 才到达；脚本 1500 毫秒后才退出，说明输出被缓冲了（违反 FR-3.2）"
         );
-        assert_eq!(outputs[0].text, "first");
-        assert!(!outputs[0].is_stderr);
-        assert_eq!(outputs[1].text, "oops");
+        // 两个管道各有一个读者，到达顺序不保证；按内容与 is_stderr 断言，不假设 stdout 先到。
+        let first = outputs
+            .iter()
+            .find(|o| o.text == "first")
+            .expect("必须收到 stdout 的 first");
+        let oops = outputs
+            .iter()
+            .find(|o| o.text == "oops")
+            .expect("必须收到 stderr 的 oops");
+        assert!(!first.is_stderr);
+        assert!(oops.is_stderr, "stderr 必须被标记（FR-3.2 要求含错误信息）");
+        assert_eq!(outputs[0].seq, 0, "序号从 0 开始");
+        assert_eq!(outputs[1].seq, 1, "序号必须连续");
         assert!(
-            outputs[1].is_stderr,
-            "stderr 必须被标记（FR-3.2 要求含错误信息）"
+            outputs[0].timestamp_ms <= outputs[1].timestamp_ms,
+            "事件顺序必须与时间戳同序（修复 2）"
         );
-        assert_eq!(outputs[0].seq + 1, outputs[1].seq, "序号必须连续");
-        assert!(
-            outputs[1].timestamp_ms >= outputs[0].timestamp_ms,
-            "时间戳不得回退"
-        );
-        assert_eq!(outputs[1].instance_id, "inst-stream");
+        assert_eq!(first.instance_id, "inst-stream");
 
         let entry = runner.get("inst-stream").expect("实例必须在登记表里");
         let (lines, next, truncated) = entry.buffer.lock().unwrap().page(0);
@@ -639,7 +732,7 @@ mod tests {
         assert!(log.contains("first"), "输出必须同时落盘：{log:?}");
     }
 
-    /// 用真的 .cmd 桩证明「cmd.exe /C 包裹」这条路径通。
+    /// 用真的 .cmd 桩证明「cmd.exe /C 包裹」这条路径通，并且两条管道并发时行管线仍同序。
     /// 桩名不是 dsh，所以不会被插入 web；它自己会睡 2 秒，活过 T-I5 的启动宽限窗口。
     #[tokio::test]
     async fn real_cmd_stub_is_spawned_through_cmd_exe() {
@@ -647,7 +740,7 @@ mod tests {
         let stub = dir.join("stub.cmd");
         std::fs::write(
             &stub,
-            "@echo off\r\necho hello from stub\r\nping -n 3 127.0.0.1 > nul\r\n",
+            "@echo off\r\nfor /L %%i in (1,1,10) do (\r\n  echo out-%%i\r\n  echo err-%%i>&2\r\n)\r\nping -n 3 127.0.0.1 > nul\r\n",
         )
         .unwrap();
 
@@ -668,14 +761,167 @@ mod tests {
             .await
             .expect("必须能通过 cmd.exe 启动 .cmd");
 
-        let mut seen: Vec<String> = Vec::new();
+        // 登记表已在 spawn 成功后写入（修复 1），此时进程还活着（桩还要 ping 2 秒）。
+        let managed = runner.managed_pids();
+        assert!(
+            managed
+                .iter()
+                .any(|m| m.instance_id == "inst-stub" && m.pid != 0),
+            "spawn 成功后必须登记受管实例：{managed:?}"
+        );
+
+        let mut outputs = Vec::new();
         let began = Instant::now();
-        while seen.is_empty() {
-            seen = emitter.outputs().into_iter().map(|p| p.text).collect();
-            assert!(began.elapsed() < Duration::from_secs(5), "必须收到输出");
+        while outputs.len() < 20 {
+            outputs = emitter.outputs();
+            assert!(
+                began.elapsed() < Duration::from_secs(5),
+                "必须收到 20 行输出：{outputs:?}"
+            );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        assert_eq!(seen[0], "hello from stub");
+        // 两个管道到达顺序不保证（各有一个读者），只要求集合完整且 seq/时间戳同序。
+        let mut actual: Vec<String> = outputs.iter().map(|o| o.text.clone()).collect();
+        actual.sort_unstable();
+        let mut expected: Vec<String> = (1..=10)
+            .flat_map(|n| [format!("out-{n}"), format!("err-{n}")])
+            .collect();
+        expected.sort_unstable();
+        assert_eq!(actual, expected, "20 行输出必须全部送达");
+        for (index, output) in outputs.iter().enumerate() {
+            assert_eq!(output.seq, index as u64, "20 行必须按序号顺序送达");
+            if index > 0 {
+                assert!(output.timestamp_ms >= outputs[index - 1].timestamp_ms);
+            }
+        }
+    }
+
+    /// 造一条状态为 running 的登记项，用于不 spawn 的测试。
+    fn test_entry(
+        managed: Arc<Mutex<ManagedRegistry>>,
+        instance_id: &str,
+        pid: u32,
+        dir: &Path,
+    ) -> Arc<InstanceEntry> {
+        Arc::new(InstanceEntry {
+            instance_id: instance_id.to_string(),
+            pid,
+            started_at_ms: 1_700_000_000_000,
+            log_path: dir.join("entry.log"),
+            buffer: Arc::new(Mutex::new(OutputBuffer::new(1000))),
+            state: Mutex::new(InstanceState::Running),
+            line_lock: Mutex::new(()),
+            managed,
+        })
+    }
+
+    /// 修复 2：stdout/stderr 两个读者并发时，seq、时间戳、落盘与事件必须同序。
+    #[test]
+    fn concurrent_pipes_are_serialized_into_one_order() {
+        let dir = temp_dir("atomic-lines");
+        let log = Arc::new(Mutex::new(
+            crate::m0::logging::LogWriter::open(dir.join("atomic.log"), 1 << 20, 1).unwrap(),
+        ));
+        let (runner, emitter) = recording_runner();
+        let entry = test_entry(runner.managed_registry(), "inst-atomic", 1, &dir);
+
+        let mut handles = Vec::new();
+        for (is_stderr, tag) in [(false, "out"), (true, "err")] {
+            let entry = entry.clone();
+            let emitter = emitter.clone();
+            let log = log.clone();
+            handles.push(std::thread::spawn(move || {
+                for n in 0..100 {
+                    entry.record_line(
+                        emitter.as_ref(),
+                        log.as_ref(),
+                        format!("{tag}-{n}"),
+                        is_stderr,
+                    );
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let outputs = emitter.outputs();
+        assert_eq!(outputs.len(), 200);
+        for (index, output) in outputs.iter().enumerate() {
+            assert_eq!(output.seq, index as u64, "事件顺序必须等于序号顺序");
+            if index > 0 {
+                assert!(
+                    output.timestamp_ms >= outputs[index - 1].timestamp_ms,
+                    "时间戳必须与序号同序"
+                );
+            }
+        }
+
+        let (lines, next, _) = entry.buffer.lock().unwrap().page(0);
+        assert_eq!(next, 200);
+        assert_eq!(lines.len(), 200);
+        for (line, output) in lines.iter().zip(outputs.iter()) {
+            assert_eq!(line.seq, output.seq);
+            assert_eq!(line.timestamp_ms, output.timestamp_ms);
+            assert_eq!(line.text, output.text);
+        }
+
+        let logged: Vec<String> = std::fs::read_to_string(dir.join("atomic.log"))
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect();
+        let expected: Vec<String> = outputs
+            .iter()
+            .map(|o| format!("[{}] {}", o.timestamp_ms, o.text))
+            .collect();
+        assert_eq!(logged, expected, "日志顺序必须与事件顺序一致");
+    }
+
+    /// 修复 3：stopped 必须在两个管道读者读到 EOF 之后才发出，
+    /// 否则 T-I5 用最后若干行输出构造的失败上下文会读早。
+    #[tokio::test]
+    async fn final_output_arrives_before_the_stopped_state() {
+        let dir = temp_dir("drain-before-stopped");
+        let (runner, emitter) = recording_runner();
+        let probe = FakeProbe::new(Vec::new());
+        let spec = build_start_spec(
+            Path::new("cmd.exe"),
+            &["/C".to_string(), "echo first&echo second".to_string()],
+            &dir,
+            "inst-drain",
+            10,
+            &dir.join("drain.log"),
+            1024,
+            1,
+        );
+
+        start(&runner, &probe, spec).await.expect("spawn 应当成功");
+
+        let began = Instant::now();
+        while !emitter
+            .states()
+            .iter()
+            .any(|s| s.state == InstanceState::Stopped)
+        {
+            assert!(
+                began.elapsed() < Duration::from_secs(5),
+                "5 秒内应看到 stopped：{:?}",
+                emitter.states()
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // 看到 stopped 时，最后一行输出必须已经送达（两个读者在 stopped 之前已 join）。
+        let outputs = emitter.outputs();
+        let mut texts: Vec<&str> = outputs.iter().map(|o| o.text.as_str()).collect();
+        texts.sort_unstable();
+        assert_eq!(texts, vec!["first", "second"], "stopped 之前必须收齐输出");
+        assert!(
+            runner.managed_pids().is_empty(),
+            "进程退出后受管登记必须清除：{:?}",
+            runner.managed_pids()
+        );
     }
 
     use crate::error::{INSTANCE_ALREADY_RUNNING, INSTANCE_NOT_MANAGED};
@@ -727,6 +973,42 @@ mod tests {
             err.next_step
         );
         assert!(runner.running_ids().is_empty(), "拒绝路径不得留下登记");
+    }
+
+    /// 修复 1：本工具实例（cmd.exe 外壳 + node.exe 子进程）在预检查里必须被认成受管，
+    /// 否则二次启动的拒绝文案会误说是「由用户自行启动」。
+    #[tokio::test]
+    async fn already_running_error_names_our_own_instance_as_managed() {
+        let dir = temp_dir("already-running-managed");
+        let (runner, _emitter) = recording_runner();
+        runner.insert(test_entry(
+            runner.managed_registry(),
+            "inst-own",
+            7001,
+            &dir,
+        ));
+        let mut child = web_proc(7002);
+        child.parent_pid = Some(7001);
+        let probe = FakeProbe::new(vec![child]);
+        let spec = build_start_spec(
+            Path::new("node"),
+            &[],
+            &dir,
+            "inst-x",
+            10,
+            &dir.join("x.log"),
+            1024,
+            1,
+        );
+
+        let err = start(&runner, &probe, spec).await.unwrap_err();
+
+        assert_eq!(err.code, INSTANCE_ALREADY_RUNNING);
+        assert!(
+            err.reason.contains("由本工具启动"),
+            "外壳的子进程必须被认成本工具实例：{}",
+            err.reason
+        );
     }
 
     /// 设计文档 §2.4 边界 2：外部实例拿不到输出，必须如实报错而不是给空内容。

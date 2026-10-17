@@ -3,12 +3,13 @@
 //! 单一事实来源是**进程枚举**，不是后端内存记录（原则 P5）。
 
 use std::collections::HashSet;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
 
 use crate::error::CmdResult;
 use crate::m3::InstanceState;
+use crate::m3::instance_runner::{ManagedInstance, ManagedRegistry};
 use crate::ports::process::{ProcInfo, ProcessProbe};
 
 /// 特征 1：bin.js 的路径尾部（规范化反斜杠为正斜杠、大小写不敏感之后比较）。
@@ -131,10 +132,12 @@ pub fn ancestor_pids(snapshot: &[ProcInfo], self_pid: u32) -> HashSet<u32> {
 
 /// 枚举 DSH Web 形态实例。没有实例时返回**空数组**且 Ok（FR-4.1：界面显示「未运行」，不得报错）。
 ///
-/// managed 是本工具已启动实例的 (pid, instanceId) 列表；now_ms 由调用方注入，便于测试。
+/// managed 是本工具已启动实例的登记；进程**自身或任一祖先进程**的 pid 命中即视为受管——
+/// 工具 spawn 的是 cmd.exe 外壳，枚举看到的却是它下面的 node.exe（修复 1）。
+/// now_ms 由调用方注入，便于测试。
 pub fn discover(
     probe: &dyn ProcessProbe,
-    managed: &[(u32, String)],
+    managed: &[ManagedInstance],
     now_ms: i64,
 ) -> CmdResult<Vec<InstanceInfo>> {
     let snapshot = probe.snapshot()?;
@@ -145,16 +148,23 @@ pub fn discover(
         if excluded.contains(&proc.pid) || !is_web_form(&proc.cmdline) {
             continue;
         }
-        let managed_id = managed
-            .iter()
-            .find(|(pid, _)| *pid == proc.pid)
-            .map(|(_, id)| id.clone());
-        let started_at_ms = proc.started_at_epoch_secs.map(|s| s as i64 * 1000);
+        let matched = if managed.is_empty() {
+            None
+        } else {
+            let chain = ancestor_pids(&snapshot, proc.pid);
+            managed.iter().find(|m| chain.contains(&m.pid))
+        };
+        let (instance_id, is_managed, started_at_ms) = match matched {
+            Some(m) => (m.instance_id.clone(), true, Some(m.started_at_ms)),
+            None => (
+                format!("pid-{}", proc.pid),
+                false,
+                proc.started_at_epoch_secs.map(|s| s as i64 * 1000),
+            ),
+        };
         out.push(InstanceInfo {
-            instance_id: managed_id
-                .clone()
-                .unwrap_or_else(|| format!("pid-{}", proc.pid)),
-            managed: managed_id.is_some(),
+            instance_id,
+            managed: is_managed,
             pid: proc.pid,
             started_at_ms,
             uptime_ms: started_at_ms.map(|s| (now_ms - s).max(0)),
@@ -174,21 +184,22 @@ pub trait InstanceLister: Send + Sync {
     fn list_web_instances(&self) -> CmdResult<Vec<InstanceInfo>>;
 }
 
-/// M3 侧对外的唯一出口：把进程端口（T-I2 落地后再带上实例登记表）组合成 InstanceLister。
+/// M3 侧对外的唯一出口：把进程端口与受管实例登记表组合成 InstanceLister。
 pub struct ProcessLister {
     probe: Arc<dyn ProcessProbe>,
+    managed: Arc<Mutex<ManagedRegistry>>,
 }
 
 impl ProcessLister {
-    pub fn new(probe: Arc<dyn ProcessProbe>) -> Self {
-        Self { probe }
+    pub fn new(probe: Arc<dyn ProcessProbe>, managed: Arc<Mutex<ManagedRegistry>>) -> Self {
+        Self { probe, managed }
     }
 }
 
 impl InstanceLister for ProcessLister {
     fn list_web_instances(&self) -> CmdResult<Vec<InstanceInfo>> {
-        // T-I2 落地后把 &[] 换成 self.runner.managed_pids()，让本工具启动的实例被标 managed。
-        discover(self.probe.as_ref(), &[], crate::m3::now_ms())
+        let managed = self.managed.lock().expect("受管登记锁被毒化").snapshot();
+        discover(self.probe.as_ref(), &managed, crate::m3::now_ms())
     }
 }
 
@@ -359,7 +370,11 @@ mod tests {
     #[test]
     fn discovers_exactly_the_two_web_instances() {
         let probe = FakeProbe::new(five_process_table());
-        let managed = vec![(100u32, "inst-1".to_string())];
+        let managed = vec![ManagedInstance {
+            pid: 100,
+            instance_id: "inst-1".to_string(),
+            started_at_ms: 1_700_000_000_000,
+        }];
 
         let list = discover(&probe, &managed, 1_700_000_500_000).unwrap();
 
@@ -423,12 +438,72 @@ mod tests {
         );
     }
 
+    /// 修复 1：工具 spawn 的 cmd.exe 外壳下面才是 node.exe，必须按祖先链命中登记，
+    /// 并沿用登记的 inst-* 标识与启动时间；无关的 web 进程仍必须是 pid-<pid>。
+    #[test]
+    fn managed_child_behind_a_cmd_shim_keeps_the_registered_id() {
+        let probe = FakeProbe::new(vec![
+            proc(
+                10,
+                Some(1),
+                Some(1_700_000_000),
+                &["cmd.exe", "/C", r#""C:\npm\dsh.cmd" web --port 3080"#],
+            ),
+            proc(
+                20,
+                Some(10),
+                Some(1_700_000_010),
+                &[NODE, BIN, "web", "--port", "3080"],
+            ),
+            proc(
+                30,
+                Some(1),
+                Some(1_700_000_020),
+                &[NODE, BIN, "web", "--port", "3099"],
+            ),
+        ]);
+        let managed = vec![ManagedInstance {
+            pid: 10,
+            instance_id: "inst-shim".to_string(),
+            started_at_ms: 1_700_000_000_000,
+        }];
+
+        let list = discover(&probe, &managed, 1_700_000_100_000).unwrap();
+
+        assert_eq!(
+            list.len(),
+            2,
+            "外壳进程本身不是 web 形态，只有两个 node：{list:?}"
+        );
+        assert_eq!(list[0].pid, 20);
+        assert!(list[0].managed, "外壳的 node 子进程必须被认成本工具实例");
+        assert_eq!(list[0].instance_id, "inst-shim");
+        assert_eq!(list[0].started_at_ms, Some(1_700_000_000_000));
+        assert_eq!(list[0].uptime_ms, Some(100_000));
+
+        assert_eq!(list[1].pid, 30);
+        assert!(!list[1].managed, "无关 web 进程不得被认成受管");
+        assert_eq!(list[1].instance_id, "pid-30");
+    }
+
     /// M1 只依赖 InstanceLister 这个 trait，且必须能以 trait 对象注入（子计划 B 的 T-V6 就靠它替换假实现）。
     #[test]
     fn instance_lister_is_the_only_surface_m1_needs() {
-        let lister = ProcessLister::new(Arc::new(FakeProbe::new(five_process_table())));
+        let registry = Arc::new(Mutex::new(ManagedRegistry::default()));
+        registry.lock().unwrap().register(ManagedInstance {
+            pid: 100,
+            instance_id: "inst-lister".to_string(),
+            started_at_ms: 1_700_000_000_000,
+        });
+        let lister = ProcessLister::new(Arc::new(FakeProbe::new(five_process_table())), registry);
         let dynamic: &dyn InstanceLister = &lister;
-        assert_eq!(dynamic.list_web_instances().unwrap().len(), 2);
+        let list = dynamic.list_web_instances().unwrap();
+        assert_eq!(list.len(), 2);
+        assert!(
+            list[0].managed,
+            "lister 必须用上 runner 的受管登记（修复 1）"
+        );
+        assert_eq!(list[0].instance_id, "inst-lister");
     }
 
     /// §5 T-I1 验收（E2E-7 前半）：本机当前运行的 dsh web 实例被列出。

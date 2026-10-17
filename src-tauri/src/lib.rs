@@ -238,11 +238,14 @@ pub fn run() {
                 OriginFacts::unidentified("来源识别尚未落地", None),
             )));
             let process_probe: Arc<dyn ProcessProbe> = Arc::new(SysinfoProbe::new());
-            let lister: Arc<dyn InstanceLister> =
-                Arc::new(ProcessLister::new(process_probe.clone()));
             let runner = Arc::new(InstanceRunner::new(Arc::new(TauriEmitter::new(
                 app.handle().clone(),
             ))));
+            // lister 与 runner 共享同一份受管登记，实例枚举才能把 cmd.exe 外壳下的 node 认成本工具实例。
+            let lister: Arc<dyn InstanceLister> = Arc::new(ProcessLister::new(
+                process_probe.clone(),
+                runner.managed_registry(),
+            ));
             app.manage(AppState {
                 settings: Arc::new(settings),
                 oplog: Arc::new(oplog),
