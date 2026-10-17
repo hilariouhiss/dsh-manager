@@ -1,16 +1,21 @@
+pub mod adapters;
 pub mod error;
 pub mod ipc;
 pub mod m0;
+pub mod m1;
+pub mod ports;
 
 use std::sync::Arc;
 
 use tauri::Manager;
 
+use crate::adapters::npm_registry::NpmRegistry;
 use crate::m0::cancel::CancelRegistry;
 use crate::m0::logging;
 use crate::m0::oplog::Oplog;
 use crate::m0::paths::DataPaths;
 use crate::m0::settings::{self, SettingsStore};
+use crate::ports::registry::RegistrySource;
 
 /// 装配点托管的统一状态。**字段名与顺序按主计划 §3.3.2 冻结**，任何任务都不得改名、
 /// 不得增删已有字段；尚未落地的字段由各自产出任务按下列顺序追加：
@@ -23,6 +28,7 @@ pub struct AppState {
     pub settings: Arc<SettingsStore>,
     pub oplog: Arc<Oplog>,
     pub cancel: Arc<CancelRegistry>,
+    pub registry: Arc<dyn RegistrySource>,
     pub paths: DataPaths,
 }
 
@@ -69,6 +75,7 @@ pub fn run() {
                 settings: Arc::new(settings),
                 oplog: Arc::new(oplog),
                 cancel: Arc::new(CancelRegistry::new()),
+                registry: Arc::new(NpmRegistry::from_net()),
                 paths,
             });
             Ok(())
