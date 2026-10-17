@@ -136,6 +136,21 @@ describe("instance store 的输出缓冲", () => {
     expect(store.paused).toBe(false);
   });
 
+  it("清空只清显示、不动回填游标；启动新实例前才归零", () => {
+    const store = useInstanceStore();
+    store.appendLine(line(4, "a"));
+    store.flushNow();
+
+    store.clear();
+    expect(store.lines).toHaveLength(0);
+    expect(store.lastSeq, "清空显示不等于丢掉回填游标").toBe(4);
+
+    store.instances = [];
+    store.clearForStart();
+    expect(store.lastSeq, "新实例序号从 0 开始，游标必须归零").toBe(-1);
+    expect(store.nextSeq).toBe(0);
+  });
+
   it("启动前只在没有运行实例时清空（有实例在跑时清掉会毁掉它的实时输出）", () => {
     const store = useInstanceStore();
     store.appendLine(line(0, "a"));
@@ -153,24 +168,135 @@ describe("instance store 的输出缓冲", () => {
   it("truncated 时整体替换缓冲而不是追加", async () => {
     invokeCmd.mockResolvedValue({ lines: [line(9, "x")], nextSeq: 10, truncated: true });
     const store = useInstanceStore();
+    store.instances = [info("inst-1", true)];
+    store.select("inst-1");
     store.appendLine(line(0, "old"));
     store.flushNow();
 
-    await store.loadOutput("inst-1", 0);
+    await store.backfillOutput();
 
-    expect(invokeCmd).toHaveBeenCalledWith("list_output", { instanceId: "inst-1", fromSeq: 0 });
+    expect(invokeCmd).toHaveBeenCalledWith("list_output", { instanceId: "inst-1", fromSeq: 1 });
     expect(store.lines.map((l) => l.seq)).toEqual([9]);
   });
 
   it("未 truncated 时把分页追加到已有行之后", async () => {
     invokeCmd.mockResolvedValue({ lines: [line(1, "b")], nextSeq: 2, truncated: false });
     const store = useInstanceStore();
+    store.instances = [info("inst-1", true)];
+    store.select("inst-1");
     store.appendLine(line(0, "a"));
     store.flushNow();
 
-    await store.loadOutput("inst-1", 1);
+    await store.backfillOutput();
 
     expect(store.lines.map((l) => l.text)).toEqual(["a", "b"]);
+  });
+});
+
+describe("instance store 的输出回填（视图重挂载后补齐离线期间的行）", () => {
+  it("只并入未持有的序号：与实时行去重并保持 seq 顺序", async () => {
+    const store = useInstanceStore();
+    store.instances = [info("inst-1", true)];
+    store.select("inst-1");
+    store.appendLine(line(0, "live-0"));
+    store.appendLine(line(2, "live-2"));
+    store.flushNow();
+    invokeCmd.mockResolvedValue({
+      lines: [line(1, "back-1"), line(2, "live-2")],
+      nextSeq: 3,
+      truncated: false,
+    });
+
+    await store.backfillOutput();
+
+    expect(invokeCmd).toHaveBeenCalledWith("list_output", {
+      instanceId: "inst-1",
+      fromSeq: 3,
+    });
+    expect(store.lines.map((l) => l.seq)).toEqual([0, 1, 2]);
+    expect(store.lines.map((l) => l.text)).toEqual(["live-0", "back-1", "live-2"]);
+
+    // 回填之后事件又重放了同一序号：不得重复并入。
+    store.appendLine(line(2, "直播重放"));
+    store.flushNow();
+    expect(store.lines.map((l) => l.text)).toEqual(["live-0", "back-1", "live-2"]);
+    expect(store.lastSeq).toBe(2);
+    expect(store.nextSeq).toBe(3);
+    expect(store.truncated).toBe(false);
+  });
+
+  it("分页从 lastSeq+1 继续；truncated 时按当前缓冲整体重建", async () => {
+    const store = useInstanceStore();
+    store.instances = [info("inst-1", true)];
+    store.select("inst-1");
+    invokeCmd.mockResolvedValueOnce({
+      lines: [line(0, "a"), line(1, "b")],
+      nextSeq: 2,
+      truncated: false,
+    });
+
+    await store.backfillOutput();
+    expect(store.lines.map((l) => l.seq)).toEqual([0, 1]);
+    expect(store.nextSeq).toBe(2);
+
+    invokeCmd.mockResolvedValueOnce({ lines: [], nextSeq: 2, truncated: false });
+    await store.backfillOutput();
+    expect(invokeCmd).toHaveBeenLastCalledWith("list_output", {
+      instanceId: "inst-1",
+      fromSeq: 2,
+    });
+    expect(store.lines.map((l) => l.seq)).toEqual([0, 1]);
+
+    invokeCmd.mockResolvedValueOnce({
+      lines: [line(9, "x"), line(10, "y")],
+      nextSeq: 11,
+      truncated: true,
+    });
+    await store.backfillOutput();
+    expect(store.lines.map((l) => l.seq)).toEqual([9, 10]);
+    expect(store.lastSeq).toBe(10);
+    expect(store.nextSeq).toBe(11);
+    expect(store.truncated).toBe(true);
+  });
+
+  it("外部实例不回填（无法获取输出）", async () => {
+    const store = useInstanceStore();
+    store.instances = [info("pid-4242", false)];
+    store.select("pid-4242");
+
+    await store.backfillOutput();
+
+    expect(invokeCmd).not.toHaveBeenCalled();
+    expect(store.lines).toHaveLength(0);
+  });
+
+  it("没有选中实例时不发命令", async () => {
+    const store = useInstanceStore();
+    await store.backfillOutput();
+    expect(invokeCmd).not.toHaveBeenCalled();
+  });
+
+  it("选中的受管实例收到 instance:state 后刷新并回填", async () => {
+    invokeCmd.mockImplementation((name: string) => {
+      if (name === "list_instances") return Promise.resolve([info("inst-1", true)]);
+      if (name === "list_output") {
+        return Promise.resolve({ lines: [line(0, "hello")], nextSeq: 1, truncated: false });
+      }
+      return Promise.resolve([]);
+    });
+    const store = useInstanceStore();
+    await store.refresh();
+    store.select("inst-1");
+    await store.subscribe();
+    const handler = handlers.get(EVENTS.EVENT_INSTANCE_STATE) as ((p: unknown) => void) | undefined;
+
+    await handler?.({ instanceId: "inst-1", state: "running", startedAtMs: 1, uptimeMs: 2 });
+
+    expect(invokeCmd).toHaveBeenCalledWith("list_output", {
+      instanceId: "inst-1",
+      fromSeq: 0,
+    });
+    expect(store.lines.map((l) => l.text)).toEqual(["hello"]);
   });
 });
 

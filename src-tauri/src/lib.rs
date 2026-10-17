@@ -440,6 +440,29 @@ fn apply_startup_behavior(app: &tauri::AppHandle) {
     }
 }
 
+/// 记录启动时发现的设置损坏（§3.7「损坏回落」的可追溯证据）。
+///
+/// 操作记录写不进去（只读/被占用）时只告警并返回 None：NFR-7 要求降级环境不得崩溃，
+/// 设置损坏也不得阻断启动；告警仍在运行日志里，不静默吞掉。
+fn record_startup_corruption(
+    oplog: &Oplog,
+    settings: &SettingsStore,
+    raw: &str,
+) -> Option<crate::m0::oplog::OplogEntry> {
+    match settings::record_corrupt(
+        oplog,
+        settings.file(),
+        raw,
+        logging::oplog_policy(&settings.snapshot()),
+    ) {
+        Ok(entry) => Some(entry),
+        Err(e) => {
+            log::warn!("记录设置损坏的操作记录失败：{}：{}", e.code, e.reason);
+            None
+        }
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -502,14 +525,10 @@ pub fn run() {
             // 设置损坏：回落默认值 + 记一条操作记录 + 推事件，不阻断启动（§3.7、NFR-7）
             if let Some(raw) = settings.startup_problem() {
                 log::warn!("设置文件存在问题，已回落默认值：{raw}");
-                let entry = settings::record_corrupt(
-                    oplog.as_ref(),
-                    settings.file(),
-                    raw,
-                    logging::oplog_policy(&settings.snapshot()),
-                )
-                .map_err(|e| format!("{}：{}", e.code, e.reason))?;
-                ipc::emit_oplog(app.handle(), &entry);
+                if let Some(entry) = record_startup_corruption(oplog.as_ref(), settings.as_ref(), raw)
+                {
+                    ipc::emit_oplog(app.handle(), &entry);
+                }
             }
 
             // 来源识别尚未落地：默认「未识别」，check_updates 因此不产出任何版本结论。
@@ -591,4 +610,55 @@ pub fn run() {
         })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn corrupt_settings(tag: &str) -> (std::path::PathBuf, SettingsStore) {
+        let dir = crate::m0::paths::temp_root(tag);
+        let settings_path = dir.join("settings.json");
+        std::fs::write(&settings_path, "{ 这不是 JSON").unwrap();
+        let store = SettingsStore::load_or_init(settings_path).unwrap();
+        (dir, store)
+    }
+
+    #[test]
+    fn startup_corruption_is_recorded_when_the_oplog_is_writable() {
+        let (dir, settings) = corrupt_settings("startup-corrupt-ok");
+        let raw = settings
+            .startup_problem()
+            .expect("损坏文件必须留下原因")
+            .to_string();
+        let oplog = Oplog::new(dir.join("oplog.jsonl"));
+
+        let entry =
+            record_startup_corruption(&oplog, &settings, &raw).expect("可写时必须记录损坏说明");
+
+        assert_eq!(entry.code.as_deref(), Some(crate::error::SETTINGS_CORRUPT));
+        assert_eq!(entry.action, "settings.load");
+        let page = oplog.read_page(0, 10).unwrap();
+        assert_eq!(page.entries.len(), 1, "损坏说明必须真的落进操作记录");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn startup_corruption_record_failure_does_not_abort_startup() {
+        let (dir, settings) = corrupt_settings("startup-corrupt-fail");
+        let raw = settings
+            .startup_problem()
+            .expect("损坏文件必须留下原因")
+            .to_string();
+        // 操作记录路径是目录：追加必然失败，模拟只读/被占用的降级环境（NFR-7）
+        let blocked = dir.join("oplog-dir");
+        std::fs::create_dir_all(&blocked).unwrap();
+        let oplog = Oplog::new(blocked);
+
+        assert!(
+            record_startup_corruption(&oplog, &settings, &raw).is_none(),
+            "记录失败只能告警，必须返回 None 让启动继续"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

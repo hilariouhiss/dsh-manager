@@ -236,6 +236,84 @@ describe("settings store", () => {
     expect(invokeCmd).not.toHaveBeenCalledWith("update_settings", expect.anything());
   });
 
+  it("选择通道走命令 2（set_auto_channel），并采用返回的设置", async () => {
+    const store = useSettingsStore();
+    store.settings = { ...DEFAULT_SETTINGS };
+    invokeCmd.mockResolvedValue({
+      ...DEFAULT_SETTINGS,
+      autoChannel: "next",
+      autoInstall: true,
+    });
+
+    await store.setAutoChannel("next");
+
+    expect(invokeCmd).toHaveBeenCalledWith("set_auto_channel", {
+      channel: "next",
+      enabled: true,
+    });
+    expect(store.settings?.autoChannel).toBe("next");
+    expect(store.settings?.autoInstall).toBe(true);
+    expect(store.error).toBeNull();
+  });
+
+  it("选择「不自动安装」用当前通道 + enabled=false 原子清空两个字段", async () => {
+    const store = useSettingsStore();
+    store.settings = { ...DEFAULT_SETTINGS, autoChannel: "latest", autoInstall: true };
+    invokeCmd.mockResolvedValue({ ...DEFAULT_SETTINGS });
+
+    await store.setAutoChannel(null);
+
+    expect(invokeCmd).toHaveBeenCalledWith("set_auto_channel", {
+      channel: "latest",
+      enabled: false,
+    });
+    expect(store.settings?.autoChannel).toBeNull();
+    expect(store.settings?.autoInstall).toBe(false);
+  });
+
+  it("本来就没有开启自动安装时，关闭不发命令", async () => {
+    const store = useSettingsStore();
+    store.settings = { ...DEFAULT_SETTINGS };
+    await store.setAutoChannel(null);
+    expect(invokeCmd).not.toHaveBeenCalled();
+  });
+
+  it("命令 2 失败时保留原设置并如实报错", async () => {
+    const store = useSettingsStore();
+    store.settings = { ...DEFAULT_SETTINGS, autoChannel: "latest", autoInstall: true };
+    invokeCmd.mockRejectedValue({
+      code: "registry.parse",
+      reason: "未定义的通道：beta。",
+      nextStep: "请从界面提供的通道列表中选择。",
+      raw: null,
+      retryable: false,
+    });
+
+    await store.setAutoChannel("beta");
+
+    expect(store.error?.code).toBe("registry.parse");
+    expect(store.settings?.autoChannel, "失败不得改写本地设置").toBe("latest");
+    expect(store.settings?.autoInstall).toBe(true);
+  });
+
+  it("setValue 的 autoChannel 也路由到命令 2，而不是 update_settings", async () => {
+    const store = useSettingsStore();
+    store.settings = { ...DEFAULT_SETTINGS };
+    invokeCmd.mockResolvedValue({
+      ...DEFAULT_SETTINGS,
+      autoChannel: "alpha",
+      autoInstall: true,
+    });
+
+    await store.setValue("autoChannel", "alpha");
+
+    expect(invokeCmd).toHaveBeenCalledWith("set_auto_channel", {
+      channel: "alpha",
+      enabled: true,
+    });
+    expect(invokeCmd).not.toHaveBeenCalledWith("update_settings", expect.anything());
+  });
+
   it("导出诊断调用 export_diagnostics 并回传字节数", async () => {
     const store = useSettingsStore();
     const target = "C:/Users/example/Desktop/dsh-manager-diagnostics.json";

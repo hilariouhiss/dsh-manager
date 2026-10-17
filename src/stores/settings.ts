@@ -312,6 +312,26 @@ export const useSettingsStore = defineStore("settings", () => {
     }
   }
 
+  /**
+   * 自动安装通道的唯一写入口（命令 2，FR-1.4）：autoChannel 与 autoInstall 必须同时落下。
+   * 选择通道 = 为它开启自动安装；选择「不自动安装」用「当前通道 + enabled=false」清空两个字段。
+   * 切换前的确认由调用方完成（纯判定见 utils/settings-view.ts）。
+   */
+  async function setAutoChannel(channel: string | null): Promise<void> {
+    error.value = null;
+    notSavedHint.value = null;
+    const target = channel ?? settings.value?.autoChannel ?? null;
+    if (target === null) return;
+    try {
+      settings.value = await invokeCmd<Settings>("set_auto_channel", {
+        channel: target,
+        enabled: channel !== null,
+      });
+    } catch (err) {
+      remember(err);
+    }
+  }
+
   /** 视图的统一入口：v-for 出来的键值对走这里，autostartMode 被路由到命令 14。 */
   async function setValue(
     key: keyof Settings,
@@ -319,6 +339,10 @@ export const useSettingsStore = defineStore("settings", () => {
   ): Promise<void> {
     if (key === "autostartMode") {
       await setAutostartMode(value as AutostartMode);
+      return;
+    }
+    if (key === "autoChannel") {
+      await setAutoChannel(typeof value === "string" && value !== "" ? value : null);
       return;
     }
     if (isNumericKey(key)) {
@@ -368,6 +392,7 @@ export const useSettingsStore = defineStore("settings", () => {
     update,
     setNumber,
     setValue,
+    setAutoChannel,
     setAutostartEnabled,
     setAutostartMode,
     exportDiagnostics,

@@ -45,6 +45,8 @@ onMounted(async () => {
   // 工作目录预填设置里的值；留空时后端也会回落（FR-3.1）。
   workDir.value = store.defaultWorkDir;
   await store.refresh();
+  // 视图卸载期间到达的行仍在后端环形缓冲里：重挂载时按 lastSeq+1 回填（FR-3.2 输出连续）。
+  await store.backfillOutput();
 });
 
 onUnmounted(() => {
@@ -54,6 +56,18 @@ onUnmounted(() => {
 });
 
 const canStart = computed(() => !busy.value);
+
+/** 选中实例后立刻回填：表格里点选与启动后选中都走这里。 */
+function selectInstance(instanceId: string): void {
+  store.select(instanceId);
+  void store.backfillOutput();
+}
+
+/** 手动刷新列表时也补一次，覆盖应用从挂起/断连恢复后错过的行。 */
+async function reload(): Promise<void> {
+  await store.refresh();
+  await store.backfillOutput();
+}
 
 async function start(): Promise<void> {
   if (busy.value) return;
@@ -72,6 +86,8 @@ async function start(): Promise<void> {
     });
     store.select(started.instanceId);
     await store.refresh();
+    // 启动宽限窗口内的输出可能早于本轮订阅到达（如启动失败前的报错），补一次。
+    await store.backfillOutput();
   } catch (e) {
     startError.value = asAppError(e);
     // 启动失败也可能留下状态事件，列表以事实为准（不静默另起）。
@@ -172,9 +188,7 @@ function openUrlOf(instance: InstanceInfo): void {
   <section class="flex flex-col gap-4">
     <header class="flex items-center justify-between gap-4">
       <h1 class="text-xl font-bold">运行实例</h1>
-      <button type="button" class="btn btn-sm" :disabled="busy" @click="store.refresh()">
-        刷新
-      </button>
+      <button type="button" class="btn btn-sm" :disabled="busy" @click="reload()">刷新</button>
     </header>
 
     <ErrorAlert v-if="startError" :error="startError" @retry="start()" />
@@ -233,7 +247,7 @@ function openUrlOf(instance: InstanceInfo): void {
                 v-for="i in store.instances"
                 :key="i.instanceId"
                 :class="i.instanceId === store.selectedId ? 'bg-base-200' : ''"
-                @click="store.select(i.instanceId)"
+                @click="selectInstance(i.instanceId)"
               >
                 <td class="font-mono text-xs whitespace-nowrap">{{ i.instanceId }}</td>
                 <td>

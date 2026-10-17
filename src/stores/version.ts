@@ -9,6 +9,7 @@ import {
   type TaskProgressPayload,
   type UpdateAvailablePayload,
 } from "../ipc/types";
+import { channelSwitchNeedsConfirm } from "../utils/settings-view";
 import type { InstallingState } from "../utils/version-view";
 
 export interface ChannelToggleRequest {
@@ -49,8 +50,7 @@ export const useVersionStore = defineStore("version", {
   actions: {
     /** 切换通道：需要确认时只返回请求，**不调用后端**（FR-1.4）。 */
     requestChannelToggle(channel: string): ChannelToggleRequest {
-      const needsConfirm = this.settings.autoInstall && this.settings.autoChannel !== channel;
-      return { needsConfirm, channel };
+      return { needsConfirm: channelSwitchNeedsConfirm(this.settings, channel), channel };
     },
 
     /** 用户确认后写设置；写回的值以后端返回为准。 */

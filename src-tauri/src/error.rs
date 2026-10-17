@@ -114,6 +114,66 @@ mod tests {
         assert!(err.retryable);
     }
 
+    /// 与 ipc.rs 的事件名用例同一模式：用字面量钉住 24 个值，改任何一个都会红。
+    #[test]
+    fn error_code_values_match_frozen_contract() {
+        let all = [
+            SETTINGS_CORRUPT,
+            PATH_PERMISSION_DENIED,
+            NETWORK_OFFLINE,
+            NETWORK_PROXY_AUTH,
+            NETWORK_TLS,
+            REGISTRY_PARSE,
+            REGISTRY_HTTP,
+            DOWNLOAD_INSUFFICIENT_SPACE,
+            DOWNLOAD_INTEGRITY_MISMATCH,
+            DOWNLOAD_NO_INTEGRITY,
+            DOWNLOAD_CANCELLED,
+            INSTALL_PM_MISSING,
+            INSTALL_INSTANCES_RUNNING,
+            INSTALL_FAILED,
+            INSTANCE_ALREADY_RUNNING,
+            INSTANCE_SPAWN_FAILED,
+            INSTANCE_PORT_IN_USE,
+            INSTANCE_EXITED_IMMEDIATELY,
+            INSTANCE_STOP_TIMEOUT,
+            INSTANCE_FORCED_STOP_REQUIRED,
+            INSTANCE_NOT_MANAGED,
+            AUTOSTART_DENIED,
+            AUTOSTART_READ_FAILED,
+            TASK_NOT_FOUND,
+        ];
+        assert_eq!(
+            all,
+            [
+                "settings.corrupt",
+                "path.permission_denied",
+                "network.offline",
+                "network.proxy_auth",
+                "network.tls",
+                "registry.parse",
+                "registry.http",
+                "download.insufficient_space",
+                "download.integrity_mismatch",
+                "download.no_integrity",
+                "download.cancelled",
+                "install.pm_missing",
+                "install.instances_running",
+                "install.failed",
+                "instance.already_running",
+                "instance.spawn_failed",
+                "instance.port_in_use",
+                "instance.exited_immediately",
+                "instance.stop_timeout",
+                "instance.forced_stop_required",
+                "instance.not_managed",
+                "autostart.denied",
+                "autostart.read_failed",
+                "task.not_found",
+            ]
+        );
+    }
+
     #[test]
     fn error_code_table_is_frozen() {
         let all = [

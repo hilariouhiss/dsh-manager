@@ -16,15 +16,10 @@ function rustConstants(source: string, prefix: string): Record<string, string> {
   return found;
 }
 
-function valuesOf(table: Record<string, string>): string[] {
-  return Object.values(table).sort();
-}
-
 describe("错误码与事件名在两侧一致（防漂移）", () => {
+  // 整表比较：名字与值的对应关系也在断言范围内，不能只比较两边的键集合与值集合。
   it("error.rs 的 pub const 与 types.ts 的 ERROR_CODES 同名同值", () => {
-    const rust = rustConstants(ERROR_RS, "");
-    expect(Object.keys(rust).sort()).toEqual(Object.keys(ERROR_CODES).sort());
-    expect(valuesOf(rust)).toEqual(valuesOf(ERROR_CODES));
+    expect(rustConstants(ERROR_RS, "")).toEqual({ ...ERROR_CODES });
   });
 
   it("error.rs 的错误码数量锁定为 24（主计划 §3.2）", () => {
@@ -32,8 +27,6 @@ describe("错误码与事件名在两侧一致（防漂移）", () => {
   });
 
   it("ipc.rs 的 EVENT_ 常量与 types.ts 的 EVENTS 同名同值", () => {
-    const rust = rustConstants(IPC_RS, "EVENT_");
-    expect(Object.keys(rust).sort()).toEqual(Object.keys(EVENTS).sort());
-    expect(valuesOf(rust)).toEqual(valuesOf(EVENTS));
+    expect(rustConstants(IPC_RS, "EVENT_")).toEqual({ ...EVENTS });
   });
 });

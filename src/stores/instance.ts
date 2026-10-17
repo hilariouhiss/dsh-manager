@@ -43,6 +43,12 @@ export const useInstanceStore = defineStore("instance", () => {
   const urls = ref<Record<string, string>>({});
   /** 暂停时的可见长度；null 表示没暂停。 */
   const pausedAt = ref<number | null>(null);
+  /** 已并入缓冲的最大序号；-1 表示还没有任何行。回填从 lastSeq+1 继续。 */
+  const lastSeq = ref(-1);
+  /** 下一个期望的序号：回填页的 nextSeq，实时行到达后同步推进。 */
+  const nextSeq = ref(0);
+  /** 最近一次回填是否因起点被环形缓冲挤出而整体重建。 */
+  const truncated = ref(false);
 
   const pending: OutputLine[] = [];
   let flushTimer: ReturnType<typeof setTimeout> | null = null;
@@ -82,6 +88,10 @@ export const useInstanceStore = defineStore("instance", () => {
   }
 
   function appendLine(line: OutputLine): void {
+    // 事件与回填可能重放已持有的序号：序号单调，已并入的行不再进缓冲。
+    if (line.seq <= lastSeq.value) return;
+    lastSeq.value = line.seq;
+    nextSeq.value = Math.max(nextSeq.value, line.seq + 1);
     pending.push(line);
     if (flushTimer === null) {
       flushTimer = setTimeout(flush, FLUSH_DELAY_MS);
@@ -108,6 +118,7 @@ export const useInstanceStore = defineStore("instance", () => {
     }
   }
 
+  /** 清空只清显示：回填游标保留，切走再回来不会把用户主动清掉的行重新拉回来。 */
   function clear(): void {
     pending.length = 0;
     lines.value = [];
@@ -118,9 +129,15 @@ export const useInstanceStore = defineStore("instance", () => {
   /**
    * 启动前清掉上一轮的行。有实例在跑时**不清**：后端会以 instance.already_running
    * 拒绝启动，清掉只会把在跑实例的实时输出抹掉，且没有回填。
+   * 新实例的输出序号从 0 重新开始，因此这里必须把回填游标一并归零。
    */
   function clearForStart(): void {
-    if (instances.value.length === 0) clear();
+    if (instances.value.length === 0) {
+      clear();
+      lastSeq.value = -1;
+      nextSeq.value = 0;
+      truncated.value = false;
+    }
   }
 
   function select(instanceId: string | null): void {
@@ -136,15 +153,35 @@ export const useInstanceStore = defineStore("instance", () => {
     }
   }
 
-  async function loadOutput(instanceId: string, fromSeq = 0): Promise<void> {
+  /**
+   * 把一页后端缓冲并入本地行：按 seq 去重并排序，截断时只丢弃快照之外的行。
+   * 合并前先并入等待中的实时行，否则它们会在 flush 后与回填行重复。
+   */
+  function mergePage(page: ListOutputResult): void {
+    flushNow();
+    // 截断时后端给的是「当前缓冲全部内容」；快照之后到达的实时行（seq >= nextSeq）必须留下。
+    const kept = page.truncated ? lines.value.filter((l) => l.seq >= page.nextSeq) : lines.value;
+    const bySeq = new Map<number, OutputLine>();
+    for (const line of [...kept, ...page.lines]) bySeq.set(line.seq, line);
+    lines.value = [...bySeq.values()].sort((a, b) => a.seq - b.seq);
+    lastSeq.value = lines.value.length === 0 ? -1 : lines.value[lines.value.length - 1].seq;
+    nextSeq.value = page.nextSeq;
+    truncated.value = page.truncated;
+  }
+
+  /**
+   * 回填选中实例的输出（命令 9）：视图重挂载或实例状态变化时补齐离线期间的行。
+   * 外部实例后端拿不到输出，直接跳过，不用空内容冒充「没有输出」（设计文档 §2.4 边界 2）。
+   */
+  async function backfillOutput(): Promise<void> {
+    const instance = selected.value;
+    if (instance === null || !instance.managed) return;
     try {
-      const page = await invokeCmd<ListOutputResult>("list_output", { instanceId, fromSeq });
-      if (page.truncated) {
-        // 起点已被环形缓冲挤出：必须整体替换，否则中间会缺行。
-        lines.value = page.lines;
-      } else {
-        lines.value.push(...page.lines);
-      }
+      const page = await invokeCmd<ListOutputResult>("list_output", {
+        instanceId: instance.instanceId,
+        fromSeq: lastSeq.value + 1,
+      });
+      mergePage(page);
       error.value = null;
     } catch (e) {
       error.value = asAppError(e);
@@ -241,8 +278,13 @@ export const useInstanceStore = defineStore("instance", () => {
         isStderr: p.isStderr,
       });
     });
-    const offState = await on<InstanceStatePayload>(EVENTS.EVENT_INSTANCE_STATE, () => {
-      void refresh();
+    const offState = await on<InstanceStatePayload>(EVENTS.EVENT_INSTANCE_STATE, async (p) => {
+      await refresh();
+      // 受管实例状态变化（例如 running）后补一次：期间可能已有输出落在缓冲里。
+      const instance = selected.value;
+      if (instance !== null && instance.instanceId === p.instanceId && instance.managed) {
+        await backfillOutput();
+      }
     });
     const offUrl = await on<InstanceUrlPayload>(EVENTS.EVENT_INSTANCE_URL, (p) => {
       // T-I3 的提取器还会认出输出里的第三方链接（例如 API 地址），
@@ -289,6 +331,9 @@ export const useInstanceStore = defineStore("instance", () => {
     error,
     stoppingId,
     urls,
+    lastSeq,
+    nextSeq,
+    truncated,
     flushNow,
     appendLine,
     togglePause,
@@ -299,7 +344,7 @@ export const useInstanceStore = defineStore("instance", () => {
     select,
     refresh,
     loadSettings,
-    loadOutput,
+    backfillOutput,
     exportAs,
     openUrl,
     stop,

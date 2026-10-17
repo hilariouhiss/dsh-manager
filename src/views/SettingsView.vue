@@ -1,8 +1,9 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from "vue";
+import { computed, onMounted, ref, shallowRef } from "vue";
 import { Download, RefreshCw, ScrollText, ShieldCheck } from "@lucide/vue";
 import { save } from "@tauri-apps/plugin-dialog";
 
+import ConfirmDialog from "../components/ConfirmDialog.vue";
 import ErrorAlert from "../components/ErrorAlert.vue";
 import {
   CHANNEL_OPTIONS,
@@ -13,6 +14,7 @@ import {
   type SettingItem,
 } from "../stores/settings";
 import { syncChecked } from "../utils/dom";
+import { channelSwitchNeedsConfirm } from "../utils/settings-view";
 import type { AutostartMode, Settings } from "../ipc/types";
 
 const store = useSettingsStore();
@@ -26,6 +28,8 @@ const oplogVisible = ref(false);
 const oplogPageSize = 20;
 const oplogPage = ref(0);
 const exportHint = ref<string | null>(null);
+/** 待确认的通道切换：确认前不改写设置，取消时把下拉框拨回原值（FR-1.4）。 */
+const pendingChannel = shallowRef<{ channel: string; select: HTMLSelectElement } | null>(null);
 
 onMounted(() => {
   void store.load();
@@ -114,9 +118,36 @@ async function commitArgs(event: Event): Promise<void> {
   await store.setValue("launchArgs", args);
 }
 
+/**
+ * 通道下拉框的唯一写入口：走命令 2 原子写入 autoChannel + autoInstall。
+ * 切换已开启自动安装的通道前先按 FR-1.4 弹普通确认；确认前不改写设置。
+ */
 async function commitChannel(event: Event): Promise<void> {
-  const target = event.target as HTMLSelectElement;
-  await store.setValue("autoChannel", target.value === "" ? null : target.value);
+  const select = event.target as HTMLSelectElement;
+  const next = select.value === "" ? null : select.value;
+  if (store.settings !== null && channelSwitchNeedsConfirm(store.settings, next)) {
+    pendingChannel.value = { channel: select.value, select };
+    return;
+  }
+  await applyChannel(select, next);
+}
+
+async function applyChannel(select: HTMLSelectElement, channel: string | null): Promise<void> {
+  await store.setAutoChannel(channel);
+  // 写入失败时 store 真值没变；显式回写，别让下拉框停在用户点出来的值。
+  select.value = String(store.settings?.autoChannel ?? "");
+}
+
+async function confirmChannelSwitch(): Promise<void> {
+  const pending = pendingChannel.value;
+  pendingChannel.value = null;
+  if (pending !== null) await applyChannel(pending.select, pending.channel);
+}
+
+function cancelChannelSwitch(): void {
+  const pending = pendingChannel.value;
+  pendingChannel.value = null;
+  if (pending !== null) pending.select.value = String(store.settings?.autoChannel ?? "");
 }
 
 async function onExportDiagnostics(): Promise<void> {
@@ -417,5 +448,14 @@ const autostartHint = computed(() => {
         </p>
       </div>
     </article>
+
+    <ConfirmDialog
+      :open="pendingChannel !== null"
+      strength="normal"
+      title="切换自动安装通道"
+      :message="`切换后，之前开启自动安装的通道会被关闭。当前选择：${store.settings?.autoChannel ?? '无'}`"
+      @confirm="confirmChannelSwitch()"
+      @cancel="cancelChannelSwitch()"
+    />
   </section>
 </template>
