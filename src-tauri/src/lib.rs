@@ -9,12 +9,13 @@ pub mod ports;
 
 use std::sync::Arc;
 
-use tauri::Manager;
+use serde::Serialize;
+use tauri::{Emitter as _, Manager};
 
 use crate::adapters::AllPackageManagers;
 use crate::adapters::npm_registry::NpmRegistry;
 use crate::adapters::sysinfo_probe::SysinfoProbe;
-use crate::error::CmdResult;
+use crate::error::{AppError, CmdResult};
 use crate::m0::cancel::CancelRegistry;
 use crate::m0::logging;
 use crate::m0::oplog::Oplog;
@@ -23,6 +24,11 @@ use crate::m0::settings::{self, SettingsStore};
 use crate::m1::version_check::{OriginFacts, SharedOriginFacts};
 use crate::m2::origin_detect::{self, OriginPaths, OriginReport, PER_SOURCE_TIMEOUT};
 use crate::m3::instance_discovery::{InstanceInfo, InstanceLister, ProcessLister};
+use crate::m3::instance_runner::{
+    self, InstanceEmitter, InstanceOutputPayload, InstanceRunner, InstanceStatePayload,
+    InstanceUrlPayload,
+};
+use crate::m3::output_buffer::OutputLine;
 use crate::ports::package_manager::PackageManager;
 use crate::ports::process::ProcessProbe;
 use crate::ports::registry::RegistrySource;
@@ -42,6 +48,7 @@ pub struct AppState {
     pub package_manager: Arc<dyn PackageManager>,
     pub process_probe: Arc<dyn ProcessProbe>,
     pub lister: Arc<dyn InstanceLister>,
+    pub runner: Arc<InstanceRunner>,
     pub paths: DataPaths,
 }
 
@@ -50,6 +57,110 @@ pub struct AppState {
 #[tauri::command]
 fn list_instances(state: tauri::State<'_, AppState>) -> CmdResult<Vec<InstanceInfo>> {
     state.lister.list_web_instances()
+}
+
+/// 真实的事件出口：每次 emit 直接经 `AppHandle` 发出去。
+/// 它由 `InstanceRunner` 持有，所以 `AppState` 不需要事件字段。
+struct TauriEmitter {
+    app: tauri::AppHandle,
+}
+
+impl TauriEmitter {
+    fn new(app: tauri::AppHandle) -> Self {
+        Self { app }
+    }
+}
+
+impl InstanceEmitter for TauriEmitter {
+    fn emit_state(&self, payload: InstanceStatePayload) {
+        let _ = self.app.emit(crate::ipc::EVENT_INSTANCE_STATE, payload);
+    }
+
+    fn emit_output(&self, payload: InstanceOutputPayload) {
+        let _ = self.app.emit(crate::ipc::EVENT_INSTANCE_OUTPUT, payload);
+    }
+
+    fn emit_url(&self, payload: InstanceUrlPayload) {
+        let _ = self.app.emit(crate::ipc::EVENT_INSTANCE_URL, payload);
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StartInstanceOutput {
+    instance_id: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ListOutputOutput {
+    lines: Vec<OutputLine>,
+    next_seq: u64,
+    truncated: bool,
+}
+
+/// §3.4 命令 7：用本工具的实例启动 DSH Web，返回实例标识。
+#[tauri::command]
+async fn start_instance(
+    state: tauri::State<'_, AppState>,
+    args: Vec<String>,
+    work_dir: String,
+) -> CmdResult<StartInstanceOutput> {
+    let launcher = crate::adapters::resolve_on_path("dsh").ok_or_else(|| {
+        AppError::new(
+            crate::error::INSTANCE_SPAWN_FAILED,
+            "PATH 中找不到 dsh 启动器，无法启动实例",
+            "先在本机命令行执行 dsh --version 确认 DSH 已安装；若找不到，请到「版本与更新」页安装后再试。",
+        )
+    })?;
+
+    let settings = state.settings.snapshot();
+
+    // FR-3.1 与 §7.1 偏差 D-B 的落点：设置里的默认启动参数（["--no-open"]）先于本次请求的参数。
+    // 少了这一句，dsh 会自己打开浏览器，autoOpenBrowser 再打开一次——T-E2「只打开一次」必失败。
+    let merged_args = instance_runner::merge_launch_args(&settings.launch_args, &args);
+
+    // FR-3.1：工作目录留空时回落到设置里的 workDir（§3.7 保证它不是空白串）。
+    let work_dir = if work_dir.trim().is_empty() {
+        settings.work_dir.clone()
+    } else {
+        work_dir
+    };
+
+    let instance_id = format!("inst-{}", crate::m3::now_ms());
+    // §3.6 的实例日志落在 DataPaths::log_dir() 下（不要自己拼 "logs" 子目录）。
+    let log_path = state.paths.instance_log(&instance_id);
+
+    let spec = instance_runner::build_start_spec(
+        &launcher,
+        &merged_args,
+        std::path::Path::new(&work_dir),
+        &instance_id,
+        settings.output_buffer_lines as usize,
+        &log_path,
+        u64::from(settings.log_max_mib) * 1024 * 1024,
+        settings.log_keep_files,
+    );
+
+    let id = instance_runner::start(&state.runner, state.process_probe.as_ref(), spec).await?;
+
+    Ok(StartInstanceOutput { instance_id: id })
+}
+
+/// §3.4 命令 9：按 `fromSeq` 取输出分页。
+#[tauri::command]
+fn list_output(
+    state: tauri::State<'_, AppState>,
+    instance_id: String,
+    from_seq: u64,
+) -> CmdResult<ListOutputOutput> {
+    let (lines, next_seq, truncated) =
+        instance_runner::list_output(state.runner.as_ref(), &instance_id, from_seq)?;
+    Ok(ListOutputOutput {
+        lines,
+        next_seq,
+        truncated,
+    })
 }
 
 /// §3.4 命令 5：识别本机 DSH 的安装来源，返回四值结论与依据清单。
@@ -94,7 +205,9 @@ pub fn run() {
             ipc::start_install,
             ipc::cancel_task,
             list_instances,
-            detect_origin
+            detect_origin,
+            start_instance,
+            list_output
         ])
         .setup(|app| {
             let paths = DataPaths::resolve(app.handle())
@@ -127,6 +240,9 @@ pub fn run() {
             let process_probe: Arc<dyn ProcessProbe> = Arc::new(SysinfoProbe::new());
             let lister: Arc<dyn InstanceLister> =
                 Arc::new(ProcessLister::new(process_probe.clone()));
+            let runner = Arc::new(InstanceRunner::new(Arc::new(TauriEmitter::new(
+                app.handle().clone(),
+            ))));
             app.manage(AppState {
                 settings: Arc::new(settings),
                 oplog: Arc::new(oplog),
@@ -135,6 +251,7 @@ pub fn run() {
                 package_manager: Arc::new(AllPackageManagers),
                 process_probe,
                 lister,
+                runner,
                 paths,
             });
             Ok(())

@@ -1,4 +1,6 @@
 pub mod instance_discovery;
+pub mod instance_runner;
+pub mod output_buffer;
 
 use serde::Serialize;
 

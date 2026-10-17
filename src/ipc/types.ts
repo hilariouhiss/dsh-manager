@@ -198,3 +198,41 @@ export interface OriginReport {
   evidences: Evidence[];
   missing: string[];
 }
+
+/** 一行实例输出（主计划 §3.6，对应 Rust 的 m3::output_buffer::OutputLine）。 */
+export interface OutputLine {
+  seq: number;
+  timestampMs: number;
+  text: string;
+  isStderr: boolean;
+}
+
+/** list_output 的出参（主计划 §3.4 命令 9）。 */
+export interface ListOutputResult {
+  lines: OutputLine[];
+  nextSeq: number;
+  truncated: boolean;
+}
+
+/** §3.5 事件 instance:state 的载荷。 */
+export interface InstanceStatePayload {
+  instanceId: string;
+  state: InstanceState;
+  startedAtMs: number | null;
+  uptimeMs: number | null;
+}
+
+/** §3.5 事件 instance:output 的载荷。 */
+export interface InstanceOutputPayload {
+  instanceId: string;
+  seq: number;
+  timestampMs: number;
+  text: string;
+  isStderr: boolean;
+}
+
+/** §3.5 事件 instance:url 的载荷（地址识别由 T-I3 接入，本任务不产出）。 */
+export interface InstanceUrlPayload {
+  instanceId: string;
+  url: string;
+}
