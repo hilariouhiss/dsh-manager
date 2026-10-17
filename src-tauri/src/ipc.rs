@@ -7,6 +7,7 @@ use tauri::{AppHandle, Emitter, State};
 
 use crate::AppState;
 use crate::error::{AppError, CmdResult};
+use crate::m0::cancel::CancelToken;
 use crate::m0::diagnostics::{self, DiagnosticsInput};
 use crate::m0::logging;
 use crate::m0::oplog::{Oplog, OplogEntry, OplogPage};
@@ -231,6 +232,18 @@ pub struct CancelTaskResult {
     pub accepted: bool,
 }
 
+/// 下载校验完成、安装开始前的取消守卫（NFR-2 / 裁定 d）。
+///
+/// `start_install` 先注销任务再查令牌：取消若发生在注销前会被令牌记下，这里拦截并删除
+/// 已验证的安装包，返回与下载阶段相同的 `download.cancelled`，绝不进入安装。
+fn reject_if_cancelled_after_verify(token: &CancelToken, tarball: &Path) -> CmdResult<()> {
+    if !token.is_cancelled() {
+        return Ok(());
+    }
+    let _ = std::fs::remove_file(tarball);
+    Err(cancelled_error())
+}
+
 /// 下载校验完成后的安装步骤（T-V6）：运行检测 → 安装 → 复核 → 清理 → 记一条操作记录。
 ///
 /// 依赖全部显式传入（临时包、通道/版本、包管理器、实例枚举、操作记录），
@@ -356,10 +369,7 @@ pub async fn start_install(
     // 注销后再查令牌，与 CancelRegistry::cancel 的互斥语义一起消除「取消被接受但仍安装」的窗口。
     state.cancel.remove(&task_id);
     // 下载/校验期间用户取消：不得进入安装；已验证的包按 §3.6 删除（NFR-2）。
-    if pre_install.is_cancelled() {
-        let _ = std::fs::remove_file(&verified.path);
-        return Err(cancelled_error());
-    }
+    reject_if_cancelled_after_verify(&pre_install, &verified.path)?;
 
     if let Err(e) = app.emit(
         EVENT_TASK_PROGRESS,
@@ -664,6 +674,59 @@ mod tests {
             "raw 要能看出 installed_before -> installed_after：{raw}"
         );
         assert_eq!(&entry, &page.entries[0]);
+    }
+
+    /// 校验后取消（裁定 d / NFR-2）：守卫删除已验证的安装包并返回 download.cancelled，
+    /// 安装 helper 与包管理器都不会被触达——这正是 `start_install` 校验后的第一道闸门。
+    #[tokio::test]
+    async fn cancelling_during_verify_refuses_the_install_without_touching_the_package_manager() {
+        let (_paths, oplog, tarball) = install_fixture("ipc-install-cancel-after-verify", "0.2.0");
+        let token = CancelToken::new_for_test();
+        token.cancel();
+        let pm = RecordingPm::new(
+            vec![Some("0.2.0-rc.2")],
+            Ok(InstallOutcome {
+                exit_code: 0,
+                output: "added 1 package".to_string(),
+            }),
+        );
+        let lister = FakeLister::empty();
+
+        // 与 start_install 相同的顺序：守卫不通过时绝不执行下面的安装步骤
+        let e = match reject_if_cancelled_after_verify(&token, &tarball) {
+            Ok(()) => install_after_download(
+                &tarball,
+                "latest/0.2.0",
+                &[pm_info()],
+                &pm,
+                &lister,
+                &oplog,
+                policy(),
+            )
+            .await
+            .0
+            .expect_err("取消后绝不允许执行安装"),
+            Err(e) => e,
+        };
+
+        assert_eq!(e.code, crate::error::DOWNLOAD_CANCELLED);
+        assert!(e.retryable, "取消后允许重新点击安装");
+        assert!(!tarball.exists(), "取消后必须删除已验证的安装包（NFR-2）");
+        assert!(
+            pm.calls().is_empty(),
+            "取消后包管理器一个方法都不该被调用：{:?}",
+            pm.calls()
+        );
+    }
+
+    #[test]
+    fn not_cancelled_after_verify_keeps_the_verified_tarball_for_install() {
+        let (_paths, _oplog, tarball) = install_fixture("ipc-install-not-cancelled", "0.2.0");
+        let token = CancelToken::new_for_test();
+
+        reject_if_cancelled_after_verify(&token, &tarball).expect("未取消时必须放行");
+
+        assert!(tarball.exists(), "未取消时安装包必须留给安装步骤");
     }
 
     #[test]
