@@ -495,26 +495,21 @@ mod tests {
         );
     }
 
-    /// 元数据存在但不可读 → 必须是 path.permission_denied，不得降级为「未安装」（§3.2 / P4）。
+    /// 元数据存在但读不出 → 必须是 path.permission_denied，不得降级为「未安装」（§3.2 / P4）。
+    ///
+    /// 用目录而不是文件锁：目录的 metadata 成功、read_to_string 必然失败。
+    /// 旧实现只靠 is_file() 判断，会把目录当「未安装」返回 Ok(None)，本用例因此能钉住 metadata 错误分支。
     #[test]
-    fn installed_version_errors_when_metadata_is_unreadable() {
-        use std::os::windows::fs::OpenOptionsExt as _;
-
-        let root = temp_dir("pm-unreadable");
+    fn installed_version_errors_when_metadata_is_a_directory() {
+        let root = temp_dir("pm-metadata-dir");
         let pkg = root.join(DSH_PACKAGE_NAME);
         std::fs::create_dir_all(&pkg).unwrap();
-        let manifest = pkg.join("package.json");
-        std::fs::write(&manifest, r#"{"version":"0.2.1-alpha.4"}"#).unwrap();
-        // 以独占方式持有文件（不共享），随后读取必然失败；metadata 仍可访问。
-        let _lock = std::fs::OpenOptions::new()
-            .read(true)
-            .share_mode(0)
-            .open(&manifest)
-            .unwrap();
+        std::fs::create_dir(pkg.join("package.json")).unwrap();
 
         let err = read_installed_version(&root).unwrap_err();
         assert_eq!(err.code, PATH_PERMISSION_DENIED);
-        assert!(err.raw.is_some(), "必须保留底层原文（原则 P4）");
+        let raw = err.raw.expect("必须保留底层原文（原则 P4）");
+        assert!(!raw.is_empty(), "raw 不得为空");
         assert!(
             err.reason.contains("package.json"),
             "原因必须带上具体文件：{}",
