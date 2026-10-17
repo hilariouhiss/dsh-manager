@@ -4,10 +4,11 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use serde::Deserialize;
+use tokio::sync::Mutex;
 
 use crate::error::{AppError, CmdResult};
 use crate::m0::ProgressSink;
@@ -112,12 +113,27 @@ fn parse_failed(e: PackumentError) -> ChannelProbe {
     )
 }
 
+/// 一次 GET 的结局。成功体、404、非 2xx 与失败都缓存，供三条通道共用。
+#[derive(Clone)]
+enum CachedPackument {
+    Body(String),
+    NotFound,
+    Http(u16),
+    Failed(AppError),
+}
+
+/// packument 缓存的有效期。三条通道并发探测共享同一次 GET（§3.8 D-1）；
+/// 5 秒的滞后对「检查更新」无影响，换来整轮检查只出一次网。
+const PACKUMENT_TTL: Duration = Duration::from_secs(5);
+
 /// 适配器。基址可注入（测试用夹具服务器），默认走真实注册表。
 pub struct NpmRegistry {
     base_url: String,
     client: reqwest::Client,
     /// 单次请求超时；默认 10 秒，构造时可注入（异步测试要能缩短它）
     timeout: Duration,
+    /// packument 短 TTL 缓存。锁跨请求持有：并发的 probe 排队等第一次 GET（单飞）。
+    packument: Mutex<Option<(Instant, CachedPackument)>>,
 }
 
 impl NpmRegistry {
@@ -129,6 +145,7 @@ impl NpmRegistry {
             base_url: Self::PROD_BASE_URL.to_string(),
             client: crate::m0::net::client().clone(),
             timeout: Duration::from_secs(10),
+            packument: Mutex::new(None),
         }
     }
 
@@ -142,12 +159,69 @@ impl NpmRegistry {
             base_url: base_url.into(),
             client,
             timeout,
+            packument: Mutex::new(None),
         }
     }
 
     fn packument_url(&self) -> String {
         // 作用域包名的 / 在 URL 里必须保留：registry.npmjs.org/@scope/name
         format!("{}/{PACKAGE_NAME}", self.base_url.trim_end_matches('/'))
+    }
+
+    /// 取 packument（单飞 + 短 TTL）。锁一直持到请求结束：三个并发 probe 中
+    /// 只有一个真正出网，其余在这里等它把结果写进缓存。
+    async fn cached_packument(&self) -> CachedPackument {
+        let mut cache = self.packument.lock().await;
+        if let Some((at, fetched)) = cache.as_ref()
+            && at.elapsed() < PACKUMENT_TTL
+        {
+            return fetched.clone();
+        }
+        let fetched = self.fetch_packument().await;
+        *cache = Some((Instant::now(), fetched.clone()));
+        fetched
+    }
+
+    /// 真正的一次 GET。失败也返回结局而不是 Err：由 probe 统一映射成 AppError。
+    async fn fetch_packument(&self) -> CachedPackument {
+        let url = self.packument_url();
+        let request = async {
+            let resp = self
+                .client
+                .get(&url)
+                .header("accept", "application/json")
+                .send()
+                .await?;
+            let status = resp.status();
+            let body = resp.text().await?;
+            Ok::<(reqwest::StatusCode, String), reqwest::Error>((status, body))
+        };
+        let (status, body) = match tokio::time::timeout(self.timeout, request).await {
+            Err(_elapsed) => {
+                return CachedPackument::Failed(
+                    AppError::new(
+                        crate::error::NETWORK_OFFLINE,
+                        format!(
+                            "请求包注册表超时（超过 {} 秒）：{url}。",
+                            self.timeout.as_secs()
+                        ),
+                        "检查网络连接或系统代理设置后重试。",
+                    )
+                    .retryable(true),
+                );
+            }
+            Ok(Err(e)) => return CachedPackument::Failed(crate::m0::net::classify(e)),
+            Ok(Ok(v)) => v,
+        };
+        // 404 表示该包在注册表里没有发布记录 → 「尚未发布」，是正常返回值而非错误
+        // （主计划 §3.2：registry.http 只覆盖非 404 状态；T-S6 把 404 留给适配器判定）。
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return CachedPackument::NotFound;
+        }
+        if !status.is_success() {
+            return CachedPackument::Http(status.as_u16());
+        }
+        CachedPackument::Body(body)
     }
 }
 
@@ -165,60 +239,29 @@ impl RegistrySource for NpmRegistry {
             );
         };
         let url = self.packument_url();
-        let request = async {
-            let resp = self
-                .client
-                .get(&url)
-                .header("accept", "application/json")
-                .send()
-                .await?;
-            let status = resp.status();
-            let body = resp.text().await?;
-            Ok::<(reqwest::StatusCode, String), reqwest::Error>((status, body))
-        };
-        let (status, body) = match tokio::time::timeout(self.timeout, request).await {
-            Err(_elapsed) => {
-                return ChannelProbe::Failed(
+        match self.cached_packument().await {
+            CachedPackument::Body(body) => match serde_json::from_str::<Packument>(&body) {
+                Ok(p) => map_packument(&p, def.dist_tag),
+                Err(e) => ChannelProbe::Failed(
                     AppError::new(
-                        crate::error::NETWORK_OFFLINE,
-                        format!(
-                            "请求包注册表超时（超过 {} 秒）：{url}。",
-                            self.timeout.as_secs()
-                        ),
-                        "检查网络连接或系统代理设置后重试。",
+                        crate::error::REGISTRY_PARSE,
+                        format!("包注册表返回体无法解析：{e}。"),
+                        "稍后重试；若持续失败，请复制原始错误反馈。",
                     )
-                    .retryable(true),
-                );
-            }
-            Ok(Err(e)) => return ChannelProbe::Failed(crate::m0::net::classify(e)),
-            Ok(Ok(v)) => v,
-        };
-        // 404 表示该包在注册表里没有发布记录 → 「尚未发布」，是正常返回值而非错误
-        // （主计划 §3.2：registry.http 只覆盖非 404 状态；T-S6 把 404 留给适配器判定）。
-        if status == reqwest::StatusCode::NOT_FOUND {
-            return ChannelProbe::Unpublished;
-        }
-        if !status.is_success() {
-            return ChannelProbe::Failed(
+                    .retryable(true)
+                    .with_raw(e.to_string()),
+                ),
+            },
+            CachedPackument::NotFound => ChannelProbe::Unpublished,
+            CachedPackument::Http(status) => ChannelProbe::Failed(
                 AppError::new(
                     crate::error::REGISTRY_HTTP,
-                    format!("包注册表返回 HTTP {}：{url}。", status.as_u16()),
+                    format!("包注册表返回 HTTP {status}：{url}。"),
                     "稍后重试；若使用代理，请检查代理是否可用。",
                 )
                 .retryable(true),
-            );
-        }
-        match serde_json::from_str::<Packument>(&body) {
-            Ok(p) => map_packument(&p, def.dist_tag),
-            Err(e) => ChannelProbe::Failed(
-                AppError::new(
-                    crate::error::REGISTRY_PARSE,
-                    format!("包注册表返回体无法解析：{e}。"),
-                    "稍后重试；若持续失败，请复制原始错误反馈。",
-                )
-                .retryable(true)
-                .with_raw(e.to_string()),
             ),
+            CachedPackument::Failed(e) => ChannelProbe::Failed(e),
         }
     }
 
@@ -509,6 +552,33 @@ mod tests {
             reg.probe("alpha").await,
             ChannelProbe::Unpublished
         ));
+    }
+
+    #[tokio::test]
+    async fn concurrent_probes_share_one_packument_get() {
+        // 夹具服务器只接受一次连接：三条通道并发探测若各发一次 GET，后两次必然连接失败。
+        // 三条全部 Published 即证明整轮检查只发了一次 GET（§3.8 D-1）。
+        let server =
+            FixtureServer::start(200, "application/json", REAL_PACKUMENT.as_bytes().to_vec());
+        let reg = NpmRegistry::with_base_url(
+            server.base_url(),
+            crate::m0::net::client().clone(),
+            Duration::from_secs(5),
+        );
+        let (latest, next, alpha) =
+            tokio::join!(reg.probe("latest"), reg.probe("next"), reg.probe("alpha"));
+        let ChannelProbe::Published(latest) = latest else {
+            panic!("latest 必须 Published，实际被判为检查失败：第一次 GET 失败");
+        };
+        let ChannelProbe::Published(next) = next else {
+            panic!("next 必须复用同一次 GET 的结果，不得再发请求");
+        };
+        let ChannelProbe::Published(alpha) = alpha else {
+            panic!("alpha 必须复用同一次 GET 的结果，不得再发请求");
+        };
+        assert_eq!(latest.version.to_string(), "0.2.0-rc.2");
+        assert_eq!(next.version.to_string(), "0.2.0-rc.2");
+        assert_eq!(alpha.version.to_string(), "0.2.1-alpha.4");
     }
 
     #[tokio::test]

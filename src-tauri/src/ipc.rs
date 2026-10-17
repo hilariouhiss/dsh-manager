@@ -11,6 +11,10 @@ use crate::m0::diagnostics::{self, DiagnosticsInput};
 use crate::m0::logging;
 use crate::m0::oplog::{OplogEntry, OplogPage};
 use crate::m0::settings::{self, Settings};
+use crate::m1::channels::ChannelsCache;
+use crate::m1::version_check::{
+    CheckUpdatesReport, SharedOriginFacts, check_updates as run_check_updates,
+};
 
 /// 事件名常量（主计划 §3.5）。前端由 src/ipc/types.ts 的 EVENTS 镜像同名同值。
 pub const EVENT_TASK_PROGRESS: &str = "task:progress";
@@ -89,6 +93,36 @@ pub fn export_diagnostics(
     };
     let bytes_written = diagnostics::export(&input, Path::new(&target_path))?;
     Ok(ExportResult { bytes_written })
+}
+
+/// §3.4 命令 1：检查更新。入参 `{ channels: string[] }`（主计划 §3.4 冻结）。
+///
+/// 本机版本与来源结论都从 T-O2 写入的共享状态里取；M1 不自己探测包管理器，也不探测来源。
+#[tauri::command]
+pub async fn check_updates(
+    channels: Vec<String>,
+    state: State<'_, AppState>,
+    facts: State<'_, SharedOriginFacts>,
+) -> CmdResult<CheckUpdatesReport> {
+    let cache_file = state.paths.cache_file();
+    let (previous, cache_error) = ChannelsCache::load(&cache_file);
+    if let Some(problem) = cache_error {
+        log::warn!("{problem}");
+    }
+    // 读锁只持有到克隆完成，不跨 await；中毒时取回内部值，不让一次旧 panic 卡住检查。
+    let facts = facts
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    run_check_updates(
+        state.registry.as_ref(),
+        &facts,
+        &channels,
+        &previous,
+        &cache_file,
+        std::time::Duration::from_secs(8),
+    )
+    .await
 }
 
 #[cfg(test)]

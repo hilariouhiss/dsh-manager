@@ -15,6 +15,7 @@ use crate::m0::logging;
 use crate::m0::oplog::Oplog;
 use crate::m0::paths::DataPaths;
 use crate::m0::settings::{self, SettingsStore};
+use crate::m1::version_check::{OriginFacts, SharedOriginFacts};
 use crate::ports::registry::RegistrySource;
 
 /// 装配点托管的统一状态。**字段名与顺序按主计划 §3.3.2 冻结**，任何任务都不得改名、
@@ -46,7 +47,8 @@ pub fn run() {
             ipc::get_settings,
             ipc::update_settings,
             ipc::list_oplog,
-            ipc::export_diagnostics
+            ipc::export_diagnostics,
+            ipc::check_updates
         ])
         .setup(|app| {
             let paths = DataPaths::resolve(app.handle())
@@ -71,6 +73,11 @@ pub fn run() {
                 ipc::emit_oplog(app.handle(), &entry);
             }
 
+            // 来源识别尚未落地：默认「未识别」，check_updates 因此不产出任何版本结论。
+            // T-O2 只更新这同一份共享状态，AppState 的冻结字段表保持不变。
+            app.manage(SharedOriginFacts::new(std::sync::RwLock::new(
+                OriginFacts::unidentified("来源识别尚未落地", None),
+            )));
             app.manage(AppState {
                 settings: Arc::new(settings),
                 oplog: Arc::new(oplog),
