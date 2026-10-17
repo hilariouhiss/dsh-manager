@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 
 use crate::error::{AppError, CmdResult};
@@ -264,6 +264,52 @@ impl TaskKill {
             .retryable(true)
         })?;
         Ok(out.status.code().unwrap_or(-1))
+    }
+}
+
+/// 端口被占用的输出特征（大小写不敏感）。配置化，便于按实测输出修正。
+pub const PORT_IN_USE_PATTERNS: &[&str] = &[
+    "eaddrinuse",
+    "address already in use",
+    "only one usage of each socket address",
+    "port is already in use",
+    "端口已被占用",
+];
+
+/// 失败上下文里回带的最后若干行输出（FR-3.6「最后若干行输出作为上下文」）。
+pub const FAILURE_CONTEXT_LINES: usize = 20;
+
+/// 启动宽限窗口：进程在这段时间内退出即判为启动失败。
+pub const STARTUP_GRACE: std::time::Duration = std::time::Duration::from_millis(800);
+
+/// 由退出码与最后的输出判定启动失败属于哪一类（FR-3.6）。
+pub fn classify_start_failure(lines: &[String], exit_code: i32) -> AppError {
+    let tail: Vec<&str> = lines
+        .iter()
+        .rev()
+        .take(FAILURE_CONTEXT_LINES)
+        .rev()
+        .map(String::as_str)
+        .collect();
+    let raw = tail.join("\n");
+    let joined = lines.join("\n").to_ascii_lowercase();
+
+    if PORT_IN_USE_PATTERNS.iter().any(|p| joined.contains(p)) {
+        AppError::new(
+            crate::error::INSTANCE_PORT_IN_USE,
+            format!("启动失败：DSH 报告端口被占用（退出码 {exit_code}）"),
+            "换一个端口再试：在启动参数里加上 --port 3099（或其他空闲端口）；也可以先停掉占用该端口的程序。",
+        )
+        .with_raw(raw)
+        .retryable(true)
+    } else {
+        AppError::new(
+            crate::error::INSTANCE_EXITED_IMMEDIATELY,
+            format!("启动失败：DSH 启动后立即退出（退出码 {exit_code}）"),
+            "检查启动参数与运行配置档是否正确；下方的最后若干行输出可用于定位原因。",
+        )
+        .with_raw(raw)
+        .retryable(true)
     }
 }
 
@@ -587,6 +633,34 @@ pub async fn start(
     runner
         .emitter()
         .emit_state(state_payload(&entry, InstanceState::Starting));
+
+    // 启动宽限窗口：窗口内退出即判为启动失败（FR-3.6），不留下一个「看起来在跑」的实例。
+    let early_exit = match tokio::time::timeout(STARTUP_GRACE, child.wait()).await {
+        Ok(Ok(status)) => Some(status.code().unwrap_or(-1)),
+        Ok(Err(_)) => Some(-1),
+        // 仍在运行：正常路径。
+        Err(_) => None,
+    };
+
+    if let Some(code) = early_exit {
+        drain_streams(stdout_task, stderr_task, &entry).await;
+
+        // 最后若干行输出就是失败呈现的上下文（FR-3.6）；读完管道再取，最后一行才不会漏。
+        let lines: Vec<String> = entry
+            .buffer
+            .lock()
+            .expect("输出缓冲锁被毒化")
+            .snapshot()
+            .into_iter()
+            .map(|l| l.text)
+            .collect();
+        entry.set_state(InstanceState::Failed);
+        runner
+            .emitter()
+            .emit_state(state_payload(&entry, InstanceState::Failed));
+        return Err(classify_start_failure(&lines, code));
+    }
+
     entry.set_state(InstanceState::Running);
     runner
         .emitter()
@@ -598,25 +672,35 @@ pub async fn start(
     let emitter = runner.emitter();
     tokio::spawn(async move {
         let _ = child.wait().await;
-        let drain = async {
-            let _ = stdout_task.await;
-            let _ = stderr_task.await;
-        };
-        if tokio::time::timeout(OUTPUT_DRAIN_TIMEOUT, drain)
-            .await
-            .is_err()
-        {
-            log::warn!(
-                "实例 {} 的进程已退出，但输出管道在 {:?} 内未读到 EOF；仍宣布 stopped",
-                supervised.instance_id,
-                OUTPUT_DRAIN_TIMEOUT
-            );
-        }
+        drain_streams(stdout_task, stderr_task, &supervised).await;
         supervised.set_state(InstanceState::Stopped);
         emitter.emit_state(state_payload(&supervised, InstanceState::Stopped));
     });
 
     Ok(entry.instance_id.clone())
+}
+
+/// 等两个管道读者读到 EOF（上限 OUTPUT_DRAIN_TIMEOUT）。超时只告警：
+/// 卡死的子进程不能把实例状态永远留在 running（修复 3）。
+async fn drain_streams(
+    stdout_task: tokio::task::JoinHandle<()>,
+    stderr_task: tokio::task::JoinHandle<()>,
+    entry: &InstanceEntry,
+) {
+    let drain = async {
+        let _ = stdout_task.await;
+        let _ = stderr_task.await;
+    };
+    if tokio::time::timeout(OUTPUT_DRAIN_TIMEOUT, drain)
+        .await
+        .is_err()
+    {
+        log::warn!(
+            "实例 {} 的输出管道在 {:?} 内未读到 EOF；仍宣布状态落幕",
+            entry.instance_id,
+            OUTPUT_DRAIN_TIMEOUT
+        );
+    }
 }
 
 #[cfg(test)]
@@ -795,6 +879,13 @@ mod tests {
 
         // 非 dsh 启动器 → 命令行就是 node -e "<脚本>"，不会被插入 web。
         let id = start(&runner, &probe, spec).await.expect("spawn 应当成功");
+
+        // T-I5 的宽限窗口让 start 在 800ms 后才返回，而脚本 1500ms 后才退出：
+        // 此刻若已有输出，就证明输出没有被缓冲到进程结束（FR-3.2）。
+        assert!(
+            !emitter.outputs().is_empty(),
+            "start 返回时脚本仍在运行；若输出被缓冲到这里会一行都没有"
+        );
         assert_eq!(id, "inst-stream");
 
         // 轮询记录型出口：既拿到两行，也拿到第一行到达的时刻。
@@ -870,7 +961,7 @@ mod tests {
             Path::new("node"),
             &[
                 "-e".to_string(),
-                "console.log('  Web UI: http://127.0.0.1:3080'); console.log('  Web UI: http://127.0.0.1:3080'); setTimeout(() => {}, 1200);"
+                "console.log('  Web UI: http://127.0.0.1:3080'); console.log('  Web UI: http://127.0.0.1:3080'); setTimeout(() => {}, 2000);"
                     .to_string(),
             ],
             &dir,
@@ -906,7 +997,7 @@ mod tests {
             Path::new("node"),
             &[
                 "-e".to_string(),
-                "console.log('http://127.0.0.1:3080'); console.error('http://127.0.0.1:3080'); setTimeout(() => {}, 1200);"
+                "console.log('http://127.0.0.1:3080'); console.error('http://127.0.0.1:3080'); setTimeout(() => {}, 2000);"
                     .to_string(),
             ],
             &dir,
@@ -1077,9 +1168,13 @@ mod tests {
         let dir = temp_dir("drain-before-stopped");
         let (runner, emitter) = recording_runner();
         let probe = FakeProbe::new(Vec::new());
+        // 桩要活过 T-I5 的启动宽限窗口，否则会被正确地判成启动失败；ping 约 2 秒。
         let spec = build_start_spec(
             Path::new("cmd.exe"),
-            &["/C".to_string(), "echo first&echo second".to_string()],
+            &[
+                "/C".to_string(),
+                "echo first&echo second&ping -n 3 127.0.0.1 > nul".to_string(),
+            ],
             &dir,
             "inst-drain",
             10,
@@ -1677,6 +1772,339 @@ mod tests {
             "taskkill 起不来也必须做停止后复核"
         );
     }
+
+    // ---- T-I5：启动失败归类（FR-3.6） ----
+
+    #[test]
+    fn port_in_use_output_is_classified() {
+        let lines = vec![
+            "starting dsh web".to_string(),
+            "Error: listen EADDRINUSE: address already in use 127.0.0.1:3080".to_string(),
+        ];
+        let err = classify_start_failure(&lines, 1);
+        assert_eq!(err.code, crate::error::INSTANCE_PORT_IN_USE);
+        assert!(
+            err.raw
+                .as_deref()
+                .unwrap_or_default()
+                .contains("EADDRINUSE"),
+            "必须带最后若干行输出作上下文（FR-3.6）"
+        );
+        assert!(
+            err.next_step.contains("--port"),
+            "建议要可操作：{}",
+            err.next_step
+        );
+        assert!(err.retryable, "instance.port_in_use 是可重试错误（§3.2）");
+    }
+
+    #[test]
+    fn any_other_immediate_exit_is_classified_as_exited_immediately() {
+        let lines: Vec<String> = (0..30).map(|i| format!("line-{i}")).collect();
+        let err = classify_start_failure(&lines, 3);
+        assert_eq!(err.code, crate::error::INSTANCE_EXITED_IMMEDIATELY);
+        let raw = err.raw.unwrap_or_default();
+        assert_eq!(
+            raw.lines().count(),
+            FAILURE_CONTEXT_LINES,
+            "只回带最后若干行，不是全部输出"
+        );
+        assert!(raw.contains("line-29"), "要保留最新的行");
+        assert!(!raw.contains("line-5"), "太早的行不该出现在上下文里");
+        assert!(
+            err.next_step.contains("运行配置档"),
+            "建议要提到运行配置档：{}",
+            err.next_step
+        );
+        assert!(
+            err.retryable,
+            "instance.exited_immediately 是可重试错误（§3.2）"
+        );
+    }
+
+    /// FR-3.6：启动后立即退出必须变成一次**失败呈现**，而不是一个「看起来成功」的实例。
+    /// 需要本机 node，因此默认忽略（纯函数版本的两个 classify 用例不受影响，照常跑）。
+    #[tokio::test]
+    #[ignore = "需要本机 PATH 中有 node：cargo test -- --ignored 显式运行"]
+    async fn an_immediately_exiting_process_is_reported_as_a_start_failure() {
+        assert!(node_available(), "本测试需要本机 PATH 中有 node");
+        let dir = temp_dir("early-exit");
+        let (runner, _emitter) = recording_runner();
+        let probe = FakeProbe::new(Vec::new());
+
+        let spec = build_start_spec(
+            Path::new("node"),
+            &[
+                "-e".to_string(),
+                "console.log('boom'); process.exit(7);".to_string(),
+            ],
+            &dir,
+            "inst-early",
+            100,
+            &dir.join("e.log"),
+            1024,
+            1,
+        );
+
+        let err = start(&runner, &probe, spec).await.unwrap_err();
+
+        assert_eq!(err.code, crate::error::INSTANCE_EXITED_IMMEDIATELY);
+        assert!(
+            err.raw.as_deref().unwrap_or_default().contains("boom"),
+            "错误上下文要包含最后几行输出：{:?}",
+            err.raw
+        );
+        assert_eq!(
+            runner.get("inst-early").unwrap().state(),
+            InstanceState::Failed,
+            "失败实例的状态必须是 failed"
+        );
+    }
+
+    /// FR-3.6：启动宽限窗口是 800ms（Lead 裁定 1），不是随手一个数字。
+    #[test]
+    fn startup_grace_window_is_800ms() {
+        assert_eq!(STARTUP_GRACE, std::time::Duration::from_millis(800));
+    }
+
+    /// 宽限窗口的另一侧：活过窗口的进程必须被正常接受为 running，不能误判成启动失败。
+    /// 需要本机 node，因此默认忽略。
+    #[tokio::test]
+    #[ignore = "需要本机 PATH 中有 node：cargo test -- --ignored 显式运行"]
+    async fn process_outliving_the_grace_window_starts_successfully() {
+        assert!(node_available(), "本测试需要本机 PATH 中有 node");
+        let dir = temp_dir("grace-outside");
+        let (runner, _emitter) = recording_runner();
+        let probe = FakeProbe::new(Vec::new());
+        let spec = build_start_spec(
+            Path::new("node"),
+            &[
+                "-e".to_string(),
+                "console.log('alive'); setTimeout(() => {}, 1200);".to_string(),
+            ],
+            &dir,
+            "inst-alive",
+            100,
+            &dir.join("a.log"),
+            1024,
+            1,
+        );
+
+        let began = Instant::now();
+        let id = start(&runner, &probe, spec)
+            .await
+            .expect("活过宽限窗口的进程必须启动成功");
+        assert_eq!(id, "inst-alive");
+        assert!(
+            began.elapsed() >= STARTUP_GRACE,
+            "start 必须等满宽限窗口才放心返回成功：{:?}",
+            began.elapsed()
+        );
+        assert_eq!(
+            runner.get("inst-alive").unwrap().state(),
+            InstanceState::Running
+        );
+    }
+
+    /// spawn 本身失败归为 instance.spawn_failed（§3.2、FR-3.6），且不留下运行中登记。
+    #[tokio::test]
+    async fn missing_program_is_reported_as_spawn_failed() {
+        let dir = temp_dir("spawn-failed");
+        let (runner, _emitter) = recording_runner();
+        let probe = FakeProbe::new(Vec::new());
+        let spec = build_start_spec(
+            Path::new("dsh-manager-no-such-program"),
+            &[],
+            &dir,
+            "inst-missing",
+            10,
+            &dir.join("m.log"),
+            1024,
+            1,
+        );
+
+        let err = start(&runner, &probe, spec).await.unwrap_err();
+
+        assert_eq!(err.code, crate::error::INSTANCE_SPAWN_FAILED);
+        assert!(!err.retryable, "instance.spawn_failed 不可重试（§3.2）");
+        assert!(err.raw.is_some(), "spawn 失败的底层原文必须保留");
+        assert!(
+            err.next_step.contains("dsh --version"),
+            "下一步要可操作：{}",
+            err.next_step
+        );
+        assert!(
+            runner.running_ids().is_empty(),
+            "spawn 失败不得留下运行中登记"
+        );
+    }
+
+    /// FR-4.4 前半：stopInstanceOnExit 为真时停本工具实例，为假时一个都不停。
+    #[test]
+    fn exit_targets_follow_the_setting() {
+        let (runner, _emitter) = recording_runner();
+        registered(&runner, 8001, "inst-a");
+        registered(&runner, 8002, "inst-b");
+        runner
+            .get("inst-b")
+            .unwrap()
+            .set_state(InstanceState::Stopped);
+
+        assert_eq!(
+            exit_stop_targets(&runner, true),
+            vec!["inst-a".to_string()],
+            "已停止的不再处理"
+        );
+        assert!(
+            exit_stop_targets(&runner, false).is_empty(),
+            "关掉设置就一个都不停"
+        );
+    }
+
+    /// FR-4.4 后半：外部实例在任何设置下都不被自动终止。
+    #[tokio::test]
+    async fn external_instances_are_never_stopped_on_exit() {
+        let (runner, _emitter) = recording_runner();
+        registered(&runner, 8001, "inst-a");
+        let probe = FakeProbe::new(vec![web_proc(4242), web_proc(8001)]).with_alive(Vec::new());
+        let kill = TaskKill::recording();
+
+        let outcome = try_stop_all_on_exit(&runner, &probe, &kill, true).await;
+
+        assert_eq!(outcome, ExitOutcome::AllStopped(vec!["inst-a".to_string()]));
+        let pids: Vec<u32> = kill.calls().into_iter().map(|(pid, _)| pid).collect();
+        assert!(
+            !pids.contains(&4242),
+            "外部实例 4242 绝不允许被自动终止（FR-4.4）：{pids:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn exit_does_nothing_when_the_setting_is_off() {
+        let (runner, _emitter) = recording_runner();
+        registered(&runner, 8001, "inst-a");
+        let probe = FakeProbe::new(vec![web_proc(8001)]).with_alive(Vec::new());
+        let kill = TaskKill::recording();
+
+        assert_eq!(
+            try_stop_all_on_exit(&runner, &probe, &kill, false).await,
+            ExitOutcome::NothingToDo
+        );
+        assert!(kill.calls().is_empty(), "关掉设置时连一次终止命令都不许发");
+    }
+
+    #[tokio::test]
+    async fn exit_does_nothing_when_no_managed_instance_is_running() {
+        let (runner, _emitter) = recording_runner();
+        let probe = FakeProbe::new(Vec::new()).with_alive(Vec::new());
+        let kill = TaskKill::recording();
+
+        assert_eq!(
+            try_stop_all_on_exit(&runner, &probe, &kill, true).await,
+            ExitOutcome::NothingToDo
+        );
+        assert!(kill.calls().is_empty());
+    }
+
+    /// §3.9「应用退出时的例外」第 1、3 步：先礼；停不下来就把决定权交回给界面，
+    /// **未经用户确认，kill.calls() 里绝不能出现 force: true**。
+    #[tokio::test]
+    async fn exit_asks_the_user_instead_of_forcing() {
+        let (runner, _emitter) = recording_runner();
+        registered(&runner, 8001, "inst-stuck");
+        let probe = FakeProbe::new(vec![web_proc(8001)]).with_alive(vec![8001]);
+        let kill = TaskKill::recording();
+
+        let outcome = try_stop_all_on_exit(&runner, &probe, &kill, true).await;
+
+        assert_eq!(
+            outcome,
+            ExitOutcome::NeedsDecision(vec![UnstoppableInstance {
+                instance_id: "inst-stuck".to_string(),
+                pid: 8001,
+            }]),
+            "停不下来时必须把决定权交给用户，而不是自己拿主意"
+        );
+        assert_eq!(kill.calls(), vec![(8001, false)], "先礼这一步不许带 /F");
+        assert!(
+            !kill.calls().iter().any(|(_, force)| *force),
+            "未经用户确认不得强制终止（FR-4.5 的单独确认）：{:?}",
+            kill.calls()
+        );
+    }
+
+    /// 用户点了「强制终止」之后才允许补 /F。
+    #[tokio::test]
+    async fn forcing_only_happens_after_the_user_says_so() {
+        let (runner, _emitter) = recording_runner();
+        registered(&runner, 8001, "inst-stuck");
+        let kill = TaskKill::recording();
+        let pending = vec![UnstoppableInstance {
+            instance_id: "inst-stuck".to_string(),
+            pid: 8001,
+        }];
+
+        let gone = FakeProbe::new(Vec::new()).with_alive(Vec::new());
+        let stopped = force_stop_pending(&runner, &gone, &kill, &pending).await;
+
+        assert_eq!(stopped, vec!["inst-stuck".to_string()]);
+        assert_eq!(kill.calls(), vec![(8001, true)], "这一步才允许带 /F");
+    }
+
+    /// 三选一确认框的返回值映射。默认按钮是「强制终止」，但**必须由用户点**。
+    #[test]
+    fn exit_choice_labels_map_to_three_actions() {
+        assert_eq!(map_exit_choice(BTN_FORCE), ExitChoice::Force);
+        assert_eq!(map_exit_choice(BTN_KEEP), ExitChoice::KeepAndExit);
+        assert_eq!(map_exit_choice(BTN_CANCEL), ExitChoice::CancelExit);
+        assert_eq!(
+            map_exit_choice("用户直接关掉了对话框"),
+            ExitChoice::CancelExit
+        );
+    }
+
+    /// 选「保留运行并退出」时如实记一条，并且**下次启动能读出来**（§3.9 第 4 步）。
+    #[test]
+    fn skipped_instances_are_remembered_for_the_next_launch() {
+        let dir = temp_dir("exit-pending");
+        let marker = pending_exit_file(&dir.join("channels.json"));
+        let pending = vec![UnstoppableInstance {
+            instance_id: "inst-stuck".to_string(),
+            pid: 8001,
+        }];
+
+        remember_skipped_instances(&marker, &pending).unwrap();
+        assert!(marker.is_file(), "选「保留运行并退出」必须留下可读的存档");
+        let text = std::fs::read_to_string(&marker).unwrap();
+        assert!(
+            text.contains("instanceId") && text.contains("8001"),
+            "存档要如实带实例标识与 pid：{text}"
+        );
+
+        assert_eq!(
+            take_startup_notice(&marker).unwrap(),
+            pending,
+            "下次启动要能读出来提示"
+        );
+        assert!(!marker.is_file(), "提示过一次就清掉，不反复打扰");
+        assert_eq!(take_startup_notice(&marker).unwrap(), Vec::new());
+    }
+
+    /// Lead 裁定 3：选「保留运行并退出」要留一条操作记录，而不只是一份存档文件。
+    #[test]
+    fn keep_running_decision_is_recorded_in_the_oplog() {
+        let entry = keep_running_oplog_entry(&[UnstoppableInstance {
+            instance_id: "inst-stuck".to_string(),
+            pid: 8001,
+        }]);
+        assert_eq!(entry.action, "instance.keep_running");
+        assert_eq!(entry.result, crate::m0::oplog::OplogResult::Ok);
+        assert!(
+            entry.target.contains("inst-stuck") && entry.target.contains("8001"),
+            "操作记录要如实带实例标识与 pid：{}",
+            entry.target
+        );
+    }
 }
 
 /// 命令 9 的实现：按 `fromSeq` 取输出分页。
@@ -1919,4 +2347,185 @@ pub async fn stop(
         residual_pids,
         forced: req.force,
     })
+}
+
+/// 应用退出时应当停止的实例标识。
+///
+/// **只包含本工具启动的实例**：外部实例从来不进登记表，所以「外部实例在任何设置下都不自动终止」
+/// （FR-4.4）在这里是结构性保证，不需要额外的归属判断。
+pub fn exit_stop_targets(runner: &InstanceRunner, stop_instance_on_exit: bool) -> Vec<String> {
+    if !stop_instance_on_exit {
+        return Vec::new();
+    }
+    runner.running_ids()
+}
+
+/// 退出时的停止时限：短一些，别让用户等太久。
+pub const EXIT_STOP_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// 退出流程的走向（§3.9「应用退出时的例外」第 1 ~ 3 步）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExitOutcome {
+    /// 设置里关掉了「退出时停止实例」，或者本来就没有运行中的本工具实例：直接退出。
+    NothingToDo,
+    /// 全部停干净了：直接退出。
+    AllStopped(Vec<String>),
+    /// 有实例没停下来：**必须**交给用户在确认框里三选一，不许自作主张。
+    NeedsDecision(Vec<UnstoppableInstance>),
+}
+
+/// 一个「先礼之后仍在运行」的实例。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UnstoppableInstance {
+    pub instance_id: String,
+    pub pid: u32,
+}
+
+/// 确认框的三个按钮文案。**lib.rs 与断言用的是同一组常量**，避免文案漂移导致映射错位。
+pub const BTN_FORCE: &str = "强制终止";
+pub const BTN_KEEP: &str = "保留运行并退出";
+pub const BTN_CANCEL: &str = "取消退出";
+
+/// 用户在确认框里的选择。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExitChoice {
+    Force,
+    KeepAndExit,
+    CancelExit,
+}
+
+/// 把确认框返回的按钮文案映射成三选一。**纯函数**，可离线单测。
+///
+/// 认不出来的文案一律按「取消退出」处理——退出这种不可逆动作上，保守才是对的。
+pub fn map_exit_choice(label: &str) -> ExitChoice {
+    match label {
+        BTN_FORCE => ExitChoice::Force,
+        BTN_KEEP => ExitChoice::KeepAndExit,
+        _ => ExitChoice::CancelExit,
+    }
+}
+
+/// 把未停止实例列成一句给用户看的话（确认框与操作记录共用，避免两处文案漂移）。
+pub fn describe_instances(pending: &[UnstoppableInstance]) -> String {
+    pending
+        .iter()
+        .map(|p| format!("{}（PID {}）", p.instance_id, p.pid))
+        .collect::<Vec<_>>()
+        .join("、")
+}
+
+/// 选「保留运行并退出」时如实写进操作记录的那一条（§3.9 第 4 步、Lead 裁定 3）。
+pub fn keep_running_oplog_entry(pending: &[UnstoppableInstance]) -> crate::m0::oplog::OplogEntry {
+    crate::m0::oplog::OplogEntry::ok("instance.keep_running", &describe_instances(pending))
+}
+
+/// 退出流程第 1 步：对每个本工具实例做**不带 /F** 的停止，然后如实汇报走向。
+///
+/// **本函数永远不发 /F**（§3.9：强制终止必须由用户在确认框里单独确认）。
+pub async fn try_stop_all_on_exit(
+    runner: &InstanceRunner,
+    probe: &dyn crate::ports::process::ProcessProbe,
+    kill: &TaskKill,
+    stop_instance_on_exit: bool,
+) -> ExitOutcome {
+    let targets = exit_stop_targets(runner, stop_instance_on_exit);
+    if targets.is_empty() {
+        return ExitOutcome::NothingToDo;
+    }
+
+    let mut stopped = Vec::new();
+    let mut pending = Vec::new();
+    for id in targets {
+        let pid = runner.get(&id).map(|e| e.pid);
+        let req = StopRequest {
+            instance_id: id.clone(),
+            force: false,
+            confirm_external: true,
+        };
+        let ok = matches!(
+            stop(runner, probe, kill, req, EXIT_STOP_WAIT, FORCE_WAIT).await,
+            Ok(result) if result.stopped
+        );
+        match (ok, pid) {
+            (true, _) => stopped.push(id),
+            (false, Some(pid)) => pending.push(UnstoppableInstance {
+                instance_id: id,
+                pid,
+            }),
+            (false, None) => {}
+        }
+    }
+
+    if pending.is_empty() {
+        ExitOutcome::AllStopped(stopped)
+    } else {
+        ExitOutcome::NeedsDecision(pending)
+    }
+}
+
+/// 退出流程第 3 步之一：用户点了「强制终止」（唯一允许发 /F 的地方）。
+pub async fn force_stop_pending(
+    runner: &InstanceRunner,
+    probe: &dyn crate::ports::process::ProcessProbe,
+    kill: &TaskKill,
+    pending: &[UnstoppableInstance],
+) -> Vec<String> {
+    let mut stopped = Vec::new();
+    for item in pending {
+        let req = StopRequest {
+            instance_id: item.instance_id.clone(),
+            force: true,
+            confirm_external: true,
+        };
+        if matches!(
+            stop(runner, probe, kill, req, EXIT_STOP_WAIT, FORCE_WAIT).await,
+            Ok(result) if result.stopped
+        ) {
+            stopped.push(item.instance_id.clone());
+        }
+    }
+    stopped
+}
+
+/// 「下次启动要提示的未停止实例」的存档位置：与通道缓存同目录，可随时删（删了只是不提示）。
+pub fn pending_exit_file(cache_file: &Path) -> PathBuf {
+    cache_file.with_file_name("exit-pending.json")
+}
+
+/// 退出流程第 4 步：用户选了「保留运行并退出」——**如实记一条**，供下次启动提示。
+pub fn remember_skipped_instances(marker: &Path, pending: &[UnstoppableInstance]) -> CmdResult<()> {
+    let text = serde_json::to_string_pretty(pending).map_err(|e| {
+        AppError::new(
+            crate::error::PATH_PERMISSION_DENIED,
+            "无法序列化未停止实例的记录",
+            "请重试；若反复出现，请在「设置」页导出诊断包反馈。",
+        )
+        .with_raw(e.to_string())
+    })?;
+    std::fs::write(marker, text).map_err(|e| {
+        AppError::new(
+            crate::error::PATH_PERMISSION_DENIED,
+            format!("无法写出未停止实例的记录：{}", marker.display()),
+            "确认该目录可写后重试。",
+        )
+        .with_raw(e.to_string())
+    })
+}
+
+/// 下次启动时读出提示并**清空**它（提示过一次就不再打扰）。文件不存在或读不出来一律返回空表。
+pub fn take_startup_notice(marker: &Path) -> CmdResult<Vec<UnstoppableInstance>> {
+    if !marker.is_file() {
+        return Ok(Vec::new());
+    }
+    let text = std::fs::read_to_string(marker).map_err(|e| {
+        AppError::new(
+            crate::error::PATH_PERMISSION_DENIED,
+            format!("无法读取未停止实例的记录：{}", marker.display()),
+            "确认该文件可读后重试。",
+        )
+        .with_raw(e.to_string())
+    })?;
+    let _ = std::fs::remove_file(marker);
+    Ok(serde_json::from_str(&text).unwrap_or_default())
 }

@@ -11,6 +11,9 @@ use std::sync::Arc;
 
 use serde::Serialize;
 use tauri::{Emitter as _, Manager};
+use tauri_plugin_dialog::{
+    DialogExt as _, MessageDialogButtons, MessageDialogKind, MessageDialogResult,
+};
 
 use crate::adapters::AllPackageManagers;
 use crate::adapters::npm_registry::NpmRegistry;
@@ -211,6 +214,39 @@ async fn detect_origin(
     Ok(report)
 }
 
+/// 退出前的阻塞式三选一（§3.9「应用退出时的例外」第 3 步）。
+///
+/// 返回按钮文案，交给 map_exit_choice 翻译。默认按钮是「强制终止」，但**必须由用户点**；
+/// 直接关掉对话框时按「取消退出」处理（不可逆动作上保守才是对的）。
+fn ask_force_or_keep(
+    app: &tauri::AppHandle,
+    pending: &[instance_runner::UnstoppableInstance],
+) -> String {
+    let result = app
+        .dialog()
+        .message(format!(
+            "以下实例在等待时限内没有退出：\n{}\n\n强制终止可能丢失它正在进行的任务。要怎么做？",
+            instance_runner::describe_instances(pending)
+        ))
+        .title("实例未响应")
+        .kind(MessageDialogKind::Warning)
+        .buttons(MessageDialogButtons::YesNoCancelCustom(
+            instance_runner::BTN_FORCE.to_string(),
+            instance_runner::BTN_KEEP.to_string(),
+            instance_runner::BTN_CANCEL.to_string(),
+        ))
+        .blocking_show_with_result();
+
+    match result {
+        MessageDialogResult::Custom(label) => label,
+        MessageDialogResult::Yes | MessageDialogResult::Ok => {
+            instance_runner::BTN_FORCE.to_string()
+        }
+        MessageDialogResult::No => instance_runner::BTN_KEEP.to_string(),
+        MessageDialogResult::Cancel => instance_runner::BTN_CANCEL.to_string(),
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -221,6 +257,84 @@ pub fn run() {
             None,
         ))
         .plugin(tauri_plugin_log::Builder::new().build())
+        .on_window_event(|window, event| {
+            let tauri::WindowEvent::CloseRequested { api, .. } = event else {
+                return;
+            };
+            let app = window.app_handle().clone();
+            // 先把句柄取出来，别让 State 借用跟着 app 进异步块。
+            let (runner, probe, oplog, marker, policy, stop_on_exit) = {
+                let state = app.state::<AppState>();
+                let settings = state.settings.snapshot();
+                (
+                    state.runner.clone(),
+                    state.process_probe.clone(),
+                    state.oplog.clone(),
+                    instance_runner::pending_exit_file(&state.paths.cache_file()),
+                    logging::oplog_policy(&settings),
+                    settings.stop_instance_on_exit,
+                )
+            };
+
+            // 没开这个设置、或本来就没有本工具实例：按默认行为直接关（FR-4.4）。
+            if !stop_on_exit || runner.running_ids().is_empty() {
+                return;
+            }
+
+            // 先拦住这次关闭，做完决定再真的退（§3.9「应用退出时的例外」）。
+            api.prevent_close();
+
+            tauri::async_runtime::spawn(async move {
+                // TaskKill 无状态，现造一个即可（AppState 里没有这个字段，也不该有）。
+                let kill = instance_runner::TaskKill::real();
+                match instance_runner::try_stop_all_on_exit(
+                    runner.as_ref(),
+                    probe.as_ref(),
+                    &kill,
+                    true,
+                )
+                .await
+                {
+                    // 第 2 步：停干净了（或本来无事可做）→ 直接退出。
+                    instance_runner::ExitOutcome::NothingToDo
+                    | instance_runner::ExitOutcome::AllStopped(_) => app.exit(0),
+
+                    // 第 3 步：阻塞式三选一。默认按钮是「强制终止」，但**必须由用户点**。
+                    instance_runner::ExitOutcome::NeedsDecision(pending) => {
+                        match instance_runner::map_exit_choice(&ask_force_or_keep(&app, &pending)) {
+                            instance_runner::ExitChoice::Force => {
+                                // 用户点了才允许补 /F（§3.9 第 3 步）。
+                                let _ = instance_runner::force_stop_pending(
+                                    runner.as_ref(),
+                                    probe.as_ref(),
+                                    &kill,
+                                    &pending,
+                                )
+                                .await;
+                                app.exit(0);
+                            }
+                            instance_runner::ExitChoice::KeepAndExit => {
+                                // 第 4 步：如实记一条操作记录，并留下下次启动要提示的存档。
+                                let entry = instance_runner::keep_running_oplog_entry(&pending);
+                                if let Err(e) = oplog.append(&entry, policy) {
+                                    log::warn!("记录「保留运行并退出」失败：{}：{}", e.code, e.reason);
+                                } else {
+                                    ipc::emit_oplog(&app, &entry);
+                                }
+                                if let Err(e) =
+                                    instance_runner::remember_skipped_instances(&marker, &pending)
+                                {
+                                    log::warn!("写下次启动提示的存档失败：{}：{}", e.code, e.reason);
+                                }
+                                app.exit(0);
+                            }
+                            // 取消退出：什么都不做，窗口保持打开（prevent_close 已经生效）。
+                            instance_runner::ExitChoice::CancelExit => {}
+                        }
+                    }
+                }
+            });
+        })
         .invoke_handler(tauri::generate_handler![
             ipc::get_settings,
             ipc::update_settings,
@@ -284,6 +398,31 @@ pub fn run() {
                 runner,
                 paths,
             });
+
+            // §3.9 第 4 步：上次退出时若选了「保留运行并退出」，这里如实提示一次并清掉存档。
+            // 提示必须在后台线程里弹：blocking_show 不能阻塞主线程，而 setup 就跑在主线程上。
+            let notice_marker = instance_runner::pending_exit_file(
+                &app.state::<AppState>().paths.cache_file(),
+            );
+            match instance_runner::take_startup_notice(&notice_marker) {
+                Ok(pending) if !pending.is_empty() => {
+                    let handle = app.handle().clone();
+                    let who = instance_runner::describe_instances(&pending);
+                    std::thread::spawn(move || {
+                        handle
+                            .dialog()
+                            .message(format!(
+                                "上次退出时还有实例未能停止：\n{who}\n\n可以在「运行实例」页现在停止它。"
+                            ))
+                            .title("上次退出时实例未停止")
+                            .blocking_show();
+                    });
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    log::warn!("读取上次退出时的未停止实例记录失败：{}：{}", e.code, e.reason);
+                }
+            }
             Ok(())
         })
         .run(tauri::generate_context!())
