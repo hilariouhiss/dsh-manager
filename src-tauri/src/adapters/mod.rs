@@ -171,23 +171,35 @@ pub(crate) async fn probe(kind: PmKind) -> Option<PmInfo> {
     probe_kind(kind, resolve_on_path(name)?).await
 }
 
-/// 从 `<global_root>/@deepseek-ai/dsh/package.json` 读取已安装版本。
-///
-/// - 文件不存在 → Ok(None)（未安装）
-/// - 文件存在但读不出 / 解析不了 / 版本串非法 → Err（**不得**降级为「未安装」，原则 P4）
+fn unreadable_manifest(manifest: &Path, e: &std::io::Error) -> AppError {
+    AppError::new(
+        PATH_PERMISSION_DENIED,
+        format!(
+            "无法读取本机 DSH 的包描述文件：{}（{e}）",
+            manifest.display()
+        ),
+        "确认该路径对当前用户可读（可能需要以同一用户身份运行本工具），然后重试。",
+    )
+    .with_raw(e.to_string())
+}
+
+/// 从 `<global_root>/@deepseek-ai/dsh/package.json` 读取已安装版本（npm/bun 布局）。
 pub(crate) fn read_installed_version(global_root: &Path) -> CmdResult<Option<Version>> {
-    let manifest = global_root.join(DSH_PACKAGE_NAME).join("package.json");
-    if !manifest.is_file() {
-        return Ok(None);
+    read_installed_version_at(&global_root.join(DSH_PACKAGE_NAME).join("package.json"))
+}
+
+/// 从指定 package.json 读取已安装版本。
+///
+/// - 文件不存在（NotFound）→ Ok(None)（未安装）
+/// - 其他元数据/读取错误（如权限不足）→ Err，**不得**降级为「未安装」（原则 P4）
+/// - 文件存在但解析不了 / 版本串非法 → Err
+pub(crate) fn read_installed_version_at(manifest: &Path) -> CmdResult<Option<Version>> {
+    match std::fs::metadata(manifest) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(unreadable_manifest(manifest, &e)),
+        Ok(_) => {}
     }
-    let text = std::fs::read_to_string(&manifest).map_err(|e| {
-        AppError::new(
-            PATH_PERMISSION_DENIED,
-            format!("无法读取本机 DSH 的包描述文件：{}", manifest.display()),
-            "确认该路径对当前用户可读（可能需要以同一用户身份运行本工具），然后重试。",
-        )
-        .with_raw(e.to_string())
-    })?;
+    let text = std::fs::read_to_string(manifest).map_err(|e| unreadable_manifest(manifest, &e))?;
     let json: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
         AppError::new(
             PATH_PERMISSION_DENIED,
@@ -235,6 +247,7 @@ pub(crate) async fn run_install(
             format!("无法启动 {label} 执行安装：{}", pm.exe.display()),
             "确认该包管理器可执行且未被安全软件拦截，然后重试。",
         )
+        .retryable(true)
     })?;
     let mut output = stdout;
     if !stderr.is_empty() {
@@ -249,7 +262,8 @@ pub(crate) async fn run_install(
                 refs.join(" ")
             ),
         )
-        .with_raw(output));
+        .with_raw(output)
+        .retryable(true));
     }
     Ok(InstallOutcome {
         exit_code: code,
@@ -295,6 +309,7 @@ mod tests {
 
     use super::fake::fake_pm::{FakePm, fake_pm_info};
     use super::*;
+    use crate::error::INSTALL_FAILED;
     use crate::ports::package_manager::{DSH_PACKAGE_NAME, PmKind};
 
     /// 每个用例一个独立临时目录，避免并行测试互相踩。
@@ -477,6 +492,61 @@ mod tests {
             err2.reason.contains("not-a-version"),
             "原因里要带上非法值：{}",
             err2.reason
+        );
+    }
+
+    /// 元数据存在但不可读 → 必须是 path.permission_denied，不得降级为「未安装」（§3.2 / P4）。
+    #[test]
+    fn installed_version_errors_when_metadata_is_unreadable() {
+        use std::os::windows::fs::OpenOptionsExt as _;
+
+        let root = temp_dir("pm-unreadable");
+        let pkg = root.join(DSH_PACKAGE_NAME);
+        std::fs::create_dir_all(&pkg).unwrap();
+        let manifest = pkg.join("package.json");
+        std::fs::write(&manifest, r#"{"version":"0.2.1-alpha.4"}"#).unwrap();
+        // 以独占方式持有文件（不共享），随后读取必然失败；metadata 仍可访问。
+        let _lock = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&manifest)
+            .unwrap();
+
+        let err = read_installed_version(&root).unwrap_err();
+        assert_eq!(err.code, PATH_PERMISSION_DENIED);
+        assert!(err.raw.is_some(), "必须保留底层原文（原则 P4）");
+        assert!(
+            err.reason.contains("package.json"),
+            "原因必须带上具体文件：{}",
+            err.reason
+        );
+    }
+
+    /// §3.2：install.failed 必须可重试，且 raw 里保留子进程原文。
+    #[tokio::test]
+    async fn install_failure_is_retryable_and_keeps_output() {
+        let dir = temp_dir("install-fail");
+        let stub = dir.join("npm.cmd");
+        std::fs::write(
+            &stub,
+            "@echo off\r\necho install boom 1>&2\r\nexit /b 7\r\n",
+        )
+        .unwrap();
+        let pm = PmInfo {
+            kind: PmKind::Npm,
+            exe: stub,
+            version: "11.6.2".to_string(),
+            global_root: dir.clone(),
+        };
+        let err = run_install(&pm, &["install", "-g"], &dir.join("dsh.tgz"))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, INSTALL_FAILED);
+        assert!(err.retryable, "install.failed 必须可重试（主计划 §3.2）");
+        let raw = err.raw.expect("失败必须保留子进程原文");
+        assert!(
+            raw.contains("install boom"),
+            "raw 必须包含子进程输出：{raw:?}"
         );
     }
 
