@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use tauri::Manager;
 
+use crate::adapters::AllPackageManagers;
 use crate::adapters::npm_registry::NpmRegistry;
 use crate::m0::cancel::CancelRegistry;
 use crate::m0::logging;
@@ -16,6 +17,7 @@ use crate::m0::oplog::Oplog;
 use crate::m0::paths::DataPaths;
 use crate::m0::settings::{self, SettingsStore};
 use crate::m1::version_check::{OriginFacts, SharedOriginFacts};
+use crate::ports::package_manager::PackageManager;
 use crate::ports::registry::RegistrySource;
 
 /// 装配点托管的统一状态。**字段名与顺序按主计划 §3.3.2 冻结**，任何任务都不得改名、
@@ -30,6 +32,7 @@ pub struct AppState {
     pub oplog: Arc<Oplog>,
     pub cancel: Arc<CancelRegistry>,
     pub registry: Arc<dyn RegistrySource>,
+    pub package_manager: Arc<dyn PackageManager>,
     pub paths: DataPaths,
 }
 
@@ -86,6 +89,7 @@ pub fn run() {
                 oplog: Arc::new(oplog),
                 cancel: Arc::new(CancelRegistry::new()),
                 registry: Arc::new(NpmRegistry::from_net()),
+                package_manager: Arc::new(AllPackageManagers),
                 paths,
             });
             Ok(())
