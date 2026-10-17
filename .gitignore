@@ -1,0 +1,24 @@
+# Dependencies
+node_modules
+
+# Build output
+dist
+*.tsbuildinfo
+
+# Logs
+*.log
+
+# Local environment files
+.env*
+!.env.example
+
+# Local tooling
+.codegraph
+
+# Editors and OS
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+Thumbs.db
+Desktop.ini
