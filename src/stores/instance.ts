@@ -15,7 +15,7 @@ import type {
   Settings,
   StopResult,
 } from "../ipc/types";
-import { asAppError, isInstanceAddress } from "../utils/instance-view";
+import { asAppError, isInstanceAddress, isLocalAddress } from "../utils/instance-view";
 
 /** 同帧到达的行先攒这么久再一次性并入——长输出不至于把界面拖死。 */
 export const FLUSH_DELAY_MS = 16;
@@ -113,6 +113,14 @@ export const useInstanceStore = defineStore("instance", () => {
     lines.value = [];
     pausedAt.value = null;
     paused.value = false;
+  }
+
+  /**
+   * 启动前清掉上一轮的行。有实例在跑时**不清**：后端会以 instance.already_running
+   * 拒绝启动，清掉只会把在跑实例的实时输出抹掉，且没有回填。
+   */
+  function clearForStart(): void {
+    if (instances.value.length === 0) clear();
   }
 
   function select(instanceId: string | null): void {
@@ -240,14 +248,23 @@ export const useInstanceStore = defineStore("instance", () => {
       // T-I3 的提取器还会认出输出里的第三方链接（例如 API 地址），
       // 只有属于这个实例的地址才显示/打开；否则会把日志里的链接当成访问入口。
       const instance = instances.value.find((i) => i.instanceId === p.instanceId);
-      if (instance === undefined || isInstanceAddress(instance.url, p.url)) {
+      // 实例还没出现在列表里时没有可核对的地址：只收本机回环地址，且不自动打开。
+      const belongs = isInstanceAddress(instance?.url ?? null, p.url);
+      if (belongs) {
         // 地址里可能带 ?token=：原样显示、原样打开，不裁剪（Lead 裁定）。
         urls.value = { ...urls.value, [p.instanceId]: p.url };
-        // FR-3.3 与偏差 D-B 的落点：本工具是**唯一**的浏览器打开方。
-        if (autoOpenBrowser.value && !openedUrls.has(p.instanceId)) {
-          openedUrls.add(p.instanceId);
-          openUrl(p.url);
-        }
+      }
+      // FR-3.3 与偏差 D-B 的落点：本工具是**唯一**的浏览器打开方。
+      // 实例未知或主机不是本机时都不自动打开（--host 局域网地址只显示链接）。
+      if (
+        belongs &&
+        instance !== undefined &&
+        isLocalAddress(p.url) &&
+        autoOpenBrowser.value &&
+        !openedUrls.has(p.instanceId)
+      ) {
+        openedUrls.add(p.instanceId);
+        openUrl(p.url);
       }
       void refresh();
     });
@@ -278,6 +295,7 @@ export const useInstanceStore = defineStore("instance", () => {
     setAutoScroll,
     setAutoOpenBrowser,
     clear,
+    clearForStart,
     select,
     refresh,
     loadSettings,

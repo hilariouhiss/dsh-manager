@@ -56,32 +56,51 @@ export function stopConfirmSpec(instance: InstanceInfo, force: boolean): StopCon
   };
 }
 
-function portOf(url: string): string | null {
+const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"]);
+
+/** 只接受 http(s)、无 userinfo 的地址：`127.0.0.1:3099@evil.com` 会解析成 evil.com。 */
+function parseAddress(candidate: string): URL | null {
   try {
-    const parsed = new URL(url);
-    if (parsed.port !== "") return parsed.port;
-    if (parsed.protocol === "https:") return "443";
-    if (parsed.protocol === "http:") return "80";
-    return null;
+    const parsed = new URL(candidate);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
+    if (parsed.username !== "" || parsed.password !== "") return null;
+    return parsed;
   } catch {
     return null;
   }
 }
 
+function effectivePort(url: URL): string {
+  if (url.port !== "") return url.port;
+  return url.protocol === "https:" ? "443" : "80";
+}
+
+/** 只有本机回环地址才允许自动打开浏览器；第三方链接一律不自动开。 */
+export function isLocalAddress(candidate: string): boolean {
+  const parsed = parseAddress(candidate);
+  return parsed !== null && LOOPBACK_HOSTS.has(parsed.hostname.toLowerCase());
+}
+
 /**
  * instance:url 事件里的地址是否属于该实例。
  *
- * T-I3 的提取器会从输出里识别任意可访问地址（第三方 API 链接也会命中），
- * 界面不能把它当成实例访问地址；优先按列表里的地址前缀判断，其次按端口兜底
- * （--host 0.0.0.0 时列表给的是监听地址、输出给的是 127.0.0.1）。
- * 列表读不到地址（例如 --port 0）时无法核对，只能接收输出里的地址。
+ * T-I3 的提取器会从输出里识别任意可访问地址（第三方 API 链接也会命中），界面不能把它
+ * 当成实例访问地址。解析后比较 origin（协议 + 主机 + 端口），不做字符串前缀比较：
+ * `http://127.0.0.1:30990`、`http://127.0.0.1:3099@evil.com` 都不能冒充 3099。
+ * 非本机地址只有在实例自己的 origin 完全一致时才接受（--host / --tls-cert）；
+ * 列表拿不到地址（--port 0）时只认本机回环地址，不把第三方链接当访问入口。
+ * 注意「0.0.0.0:3099 监听、输出给 127.0.0.1:3099」要靠端口兜底，主机写法不同 origin 不同。
  */
 export function isInstanceAddress(known: string | null, candidate: string): boolean {
-  if (known === null) return true;
-  if (candidate.startsWith(known)) return true;
-  const knownPort = portOf(known);
-  const candidatePort = portOf(candidate);
-  return knownPort !== null && knownPort === candidatePort;
+  const parsed = parseAddress(candidate);
+  if (parsed === null) return false;
+  const knownUrl = known === null ? null : parseAddress(known);
+  if (knownUrl === null) return LOOPBACK_HOSTS.has(parsed.hostname.toLowerCase());
+  if (parsed.origin === knownUrl.origin) return true;
+  return (
+    LOOPBACK_HOSTS.has(parsed.hostname.toLowerCase()) &&
+    effectivePort(parsed) === effectivePort(knownUrl)
+  );
 }
 
 /** 把 catch 到的未知值收窄成可展示的 AppError：后端错误原样返回，其余包成原因 + 下一步。 */

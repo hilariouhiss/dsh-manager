@@ -63,8 +63,9 @@ async function start(): Promise<void> {
   savedHint.value = null;
   try {
     const args = argsText.value.split(/\s+/).filter((s) => s.length > 0);
-    // 新的一次运行：先清掉上一轮的行，避免与旧实例的输出混在一起。
-    store.clear();
+    // 新的一次运行：先清掉上一轮的行。有实例在跑时后端会拒绝启动，
+    // 此时不能清，否则会把在跑实例的实时输出抹掉（store 里判断）。
+    store.clearForStart();
     const started = await invokeCmd<{ instanceId: string }>("start_instance", {
       args,
       workDir: workDir.value,

@@ -13,6 +13,8 @@ pub const NOISE_HOSTS: &[&str] = &[
     "www.npmjs.com",
     "npmjs.com",
     "nodejs.org",
+    // 模型列表会打印第三方 API 地址（真机实测 https://api.deepseek.com/models）。
+    "api.deepseek.com",
 ];
 
 const SCHEMES: [&str; 2] = ["http://", "https://"];
@@ -204,6 +206,21 @@ mod tests {
         assert_eq!(
             ex.feed("registry https://registry.npmjs.org/x then http://127.0.0.1:3080"),
             Some("http://127.0.0.1:3080".to_string())
+        );
+    }
+
+    #[test]
+    fn ignores_third_party_links_printed_in_model_listings() {
+        let mut ex = UrlExtractor::new();
+        assert_eq!(
+            ex.feed("model listing from https://api.deepseek.com/models"),
+            None,
+            "第三方 API 链接不能被当成实例访问地址"
+        );
+        // 噪声之后仍能识别真正的地址
+        assert_eq!(
+            ex.feed("api https://api.deepseek.com/models then http://127.0.0.1:3099/"),
+            Some("http://127.0.0.1:3099/".to_string())
         );
     }
 

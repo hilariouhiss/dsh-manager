@@ -46,14 +46,14 @@ function line(seq: number, text: string, isStderr = false): OutputLine {
   return { seq, timestampMs: 1_700_000_000_000 + seq, text, isStderr };
 }
 
-function info(instanceId: string, managed: boolean): InstanceInfo {
+function info(instanceId: string, managed: boolean, url = "http://127.0.0.1:3080"): InstanceInfo {
   return {
     instanceId,
     managed,
     pid: managed ? 5000 : 4242,
     startedAtMs: 1_700_000_000_000,
     uptimeMs: 1000,
-    url: "http://127.0.0.1:3080",
+    url,
     state: "running",
   };
 }
@@ -134,6 +134,20 @@ describe("instance store 的输出缓冲", () => {
     expect(store.lines).toHaveLength(0);
     expect(store.renderedLines).toHaveLength(0);
     expect(store.paused).toBe(false);
+  });
+
+  it("启动前只在没有运行实例时清空（有实例在跑时清掉会毁掉它的实时输出）", () => {
+    const store = useInstanceStore();
+    store.appendLine(line(0, "a"));
+    store.flushNow();
+
+    store.instances = [info("inst-1", true)];
+    store.clearForStart();
+    expect(store.lines.map((l) => l.text)).toEqual(["a"]);
+
+    store.instances = [];
+    store.clearForStart();
+    expect(store.lines).toHaveLength(0);
   });
 
   it("truncated 时整体替换缓冲而不是追加", async () => {
@@ -262,15 +276,55 @@ describe("instance store 的事件订阅", () => {
     expect(openUrl).not.toHaveBeenCalled();
   });
 
+  it("实例还没出现在列表里时不自动打开地址（不 fail-open）", async () => {
+    invokeCmd.mockResolvedValue([]);
+    const store = useInstanceStore();
+    await store.subscribe();
+    const handler = handlers.get(EVENTS.EVENT_INSTANCE_URL) as
+      | ((p: InstanceUrlPayload) => void)
+      | undefined;
+    handler?.({ instanceId: "inst-late", url: "http://127.0.0.1:3099/?token=abc" });
+    await Promise.resolve();
+
+    expect(openUrl).not.toHaveBeenCalled();
+    // 本机地址仍可留作显示：实例随后出现在列表里时用得到。
+    expect(store.urls["inst-late"]).toBe("http://127.0.0.1:3099/?token=abc");
+  });
+
+  it("非本机地址与实例 origin 一致时只显示链接，不自动打开", async () => {
+    invokeCmd.mockImplementation((name: string) =>
+      name === "list_instances"
+        ? Promise.resolve([info("inst-1", true, "http://10.0.0.7:8080")])
+        : Promise.resolve([]),
+    );
+    const store = useInstanceStore();
+    await store.refresh();
+    await store.subscribe();
+    const handler = handlers.get(EVENTS.EVENT_INSTANCE_URL) as
+      | ((p: InstanceUrlPayload) => void)
+      | undefined;
+    handler?.({ instanceId: "inst-1", url: "http://10.0.0.7:8080/?token=abc" });
+    await Promise.resolve();
+
+    expect(store.urlFor(info("inst-1", true, "http://10.0.0.7:8080"))).toBe(
+      "http://10.0.0.7:8080/?token=abc",
+    );
+    expect(openUrl).not.toHaveBeenCalled();
+  });
+
   /// FR-3.3 与 §7.1 偏差 D-B 的落点：**是否自动打开浏览器必须是设置项**。
   it("autoOpenBrowser 为真才打开地址，为假时只接收不打开", async () => {
     invokeCmd.mockImplementation((name: string) => {
       if (name === "get_settings") return Promise.resolve(settings({ autoOpenBrowser: false }));
+      if (name === "list_instances") {
+        return Promise.resolve([info("inst-1", true, "http://127.0.0.1:3099")]);
+      }
       return Promise.resolve([]);
     });
 
     const store = useInstanceStore();
     await store.loadSettings();
+    await store.refresh();
     await store.subscribe();
     const handler = handlers.get(EVENTS.EVENT_INSTANCE_URL) as
       | ((p: InstanceUrlPayload) => void)
@@ -287,8 +341,9 @@ describe("instance store 的事件订阅", () => {
   });
 
   it("同一实例的地址只自动打开一次（后端重发也不重复开浏览器）", async () => {
-    invokeCmd.mockResolvedValue([]);
+    invokeCmd.mockResolvedValue([info("inst-1", true, "http://127.0.0.1:3099")]);
     const store = useInstanceStore();
+    await store.refresh();
     await store.subscribe();
     const handler = handlers.get(EVENTS.EVENT_INSTANCE_URL) as
       | ((p: InstanceUrlPayload) => void)

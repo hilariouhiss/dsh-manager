@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vite-plus/test";
 
-import { asAppError, isInstanceAddress, stopConfirmSpec } from "./instance-view";
+import { asAppError, isInstanceAddress, isLocalAddress, stopConfirmSpec } from "./instance-view";
 import type { InstanceInfo } from "../ipc/types";
 
 function info(overrides: Partial<InstanceInfo> = {}): InstanceInfo {
@@ -56,7 +56,7 @@ describe("stopConfirmSpec（§3.9 D-3 三档确认）", () => {
 });
 
 describe("isInstanceAddress（过滤输出里混入的第三方链接）", () => {
-  it("同源且带 token 的地址属于本实例", () => {
+  it("同源且带 token 的本地地址属于本实例", () => {
     expect(isInstanceAddress("http://127.0.0.1:3099", "http://127.0.0.1:3099/?token=abc")).toBe(
       true,
     );
@@ -72,8 +72,51 @@ describe("isInstanceAddress（过滤输出里混入的第三方链接）", () =>
     );
   });
 
-  it("列表拿不到地址时无法核对，照单接收（--port 0 只能靠输出）", () => {
+  it("未知实例（known 为 null）只收本机回环地址，不把第三方链接当访问入口", () => {
     expect(isInstanceAddress(null, "http://127.0.0.1:43210")).toBe(true);
+    expect(isInstanceAddress(null, "https://api.deepseek.com/models")).toBe(false);
+    expect(isInstanceAddress(null, "http://10.0.0.7:3099")).toBe(false);
+  });
+
+  it("userinfo 伪装（:3099@evil.com）被拒绝", () => {
+    expect(isInstanceAddress("http://127.0.0.1:3099", "http://127.0.0.1:3099@evil.com/")).toBe(
+      false,
+    );
+  });
+
+  it("端口后缀伪装（:30990、:3099.evil.com）被拒绝", () => {
+    expect(isInstanceAddress("http://127.0.0.1:3099", "http://127.0.0.1:30990")).toBe(false);
+    expect(isInstanceAddress("http://127.0.0.1:3099", "http://127.0.0.1:3099.evil.com/")).toBe(
+      false,
+    );
+  });
+
+  it("非 http(s) 地址被拒绝", () => {
+    expect(isInstanceAddress("http://127.0.0.1:3099", "javascript:alert(1)")).toBe(false);
+    expect(isInstanceAddress("http://127.0.0.1:3099", "file:///C:/secret.txt")).toBe(false);
+  });
+
+  it("非本机地址只有在与实例自己的 origin 完全一致时才接受（--host 局域网 / --tls-cert）", () => {
+    expect(isInstanceAddress("http://10.0.0.7:8080", "http://10.0.0.7:8080/?token=abc")).toBe(true);
+    expect(isInstanceAddress("http://10.0.0.7:8080", "https://10.0.0.7:8080/?token=abc")).toBe(
+      false,
+    );
+    expect(isInstanceAddress("http://127.0.0.1:3099", "http://10.0.0.7:3099")).toBe(false);
+  });
+});
+
+describe("isLocalAddress（自动打开浏览器前的本机校验）", () => {
+  it("localhost / 127.0.0.1 / ::1 是本机地址", () => {
+    expect(isLocalAddress("http://localhost:3099")).toBe(true);
+    expect(isLocalAddress("http://127.0.0.1:3099/?token=abc")).toBe(true);
+    expect(isLocalAddress("http://[::1]:3099/")).toBe(true);
+  });
+
+  it("第三方主机、userinfo 伪装与非 http(s) 都不是本机地址", () => {
+    expect(isLocalAddress("https://api.deepseek.com/models")).toBe(false);
+    expect(isLocalAddress("http://127.0.0.1:3099@evil.com/")).toBe(false);
+    expect(isLocalAddress("javascript:alert(1)")).toBe(false);
+    expect(isLocalAddress("not a url")).toBe(false);
   });
 });
 
