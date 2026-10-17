@@ -94,11 +94,13 @@ pub fn append(file: &Path, entry: &OplogEntry, policy: RollPolicy) -> CmdResult<
     logging::append_line(file, &line, policy)
 }
 
-/// 分页读取，**最新一条在前**；解析不了的行（崩溃时的半行）跳过，不影响其它行。
+/// 分页读取，**最新一条在前**；解析不了的行（崩溃时的半行，可能不是合法 UTF-8）跳过，不影响其它行。
 pub fn read_page(path: &Path, offset: usize, limit: usize) -> CmdResult<OplogPage> {
-    let text = match fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+    // 按字节读：崩溃可能把最后一行撕在 UTF-8 字符中间，此时整个文件不是合法 UTF-8，
+    // read_to_string 会失败并连累前面的完整行。
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
         Err(e) => {
             return Err(AppError::new(
                 error::PATH_PERMISSION_DENIED,
@@ -108,9 +110,9 @@ pub fn read_page(path: &Path, offset: usize, limit: usize) -> CmdResult<OplogPag
             .with_raw(e.to_string()));
         }
     };
-    let mut entries: Vec<OplogEntry> = text
-        .lines()
-        .filter_map(|line| serde_json::from_str::<OplogEntry>(line).ok())
+    let mut entries: Vec<OplogEntry> = bytes
+        .split(|byte| *byte == b'\n')
+        .filter_map(|line| serde_json::from_slice::<OplogEntry>(line).ok())
         .collect();
     let total = entries.len();
     entries.reverse();
@@ -215,6 +217,34 @@ mod tests {
         let page = read_page(&paths.oplog_file(), 0, 10).unwrap();
         assert_eq!(page.total, 2, "半行被跳过，已写入的两行仍可读");
         assert_eq!(page.entries[0].action, "second");
+    }
+
+    #[test]
+    fn torn_multibyte_tail_still_reads_earlier_lines() {
+        let paths = fixture("oplog-crash-utf8");
+        append(
+            &paths.oplog_file(),
+            &OplogEntry::ok("第一", "中文目标"),
+            pol(),
+        )
+        .unwrap();
+        append(
+            &paths.oplog_file(),
+            &OplogEntry::ok("第二", "中文目标"),
+            pol(),
+        )
+        .unwrap();
+        // 模拟崩溃撕在多字节字符中间：最后一行是半截 JSON，且以「中」的前 2 个字节收尾，
+        // 整个文件因此不是合法 UTF-8。
+        let mut bytes = fs::read(paths.oplog_file()).unwrap();
+        bytes.extend_from_slice("{\"timestampMs\":123,\"action\":\"".as_bytes());
+        bytes.extend_from_slice(&[0xE4, 0xB8]);
+        fs::write(paths.oplog_file(), bytes).unwrap();
+
+        let page = read_page(&paths.oplog_file(), 0, 10).unwrap();
+        assert_eq!(page.total, 2, "非法 UTF-8 的撕裂行被跳过，已写入行仍可读");
+        assert_eq!(page.entries[0].action, "第二");
+        assert_eq!(page.entries[0].target, "中文目标");
     }
 
     #[test]

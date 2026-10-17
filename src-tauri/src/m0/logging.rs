@@ -2,8 +2,8 @@
 //!
 //! 操作记录与实例运行日志共用这一份实现，避免两套滚动逻辑各自漂移。
 
-use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use crate::error::{self, AppError, CmdResult};
@@ -83,10 +83,27 @@ pub fn append_line(file: &Path, line: &str, policy: RollPolicy) -> CmdResult<()>
     }
     let mut handle = OpenOptions::new()
         .create(true)
+        .read(true)
         .append(true)
         .open(file)
         .map_err(|e| io_error("打开日志文件", file, e))?;
+    repair_tail(&mut handle).map_err(|e| io_error("补写日志换行", file, e))?;
     writeln!(handle, "{line}").map_err(|e| io_error("写入日志文件", file, e))
+}
+
+/// 崩溃可能让最后一行缺换行；追加前补一个，避免新行与撕裂行粘连成同一行而丢失。
+fn repair_tail(handle: &mut File) -> std::io::Result<()> {
+    let len = handle.metadata()?.len();
+    if len == 0 {
+        return Ok(());
+    }
+    handle.seek(SeekFrom::Start(len - 1))?;
+    let mut last = [0u8; 1];
+    handle.read_exact(&mut last)?;
+    if last[0] != b'\n' {
+        handle.write_all(b"\n")?;
+    }
+    Ok(())
 }
 
 /// 把 <file> → <file>.1 → <file>.2 …；超出 keep_files 的最旧一份被删除。
@@ -194,6 +211,19 @@ mod tests {
             !rolled_path(&file, 2).exists(),
             "keep_files = 1 时只保留一份"
         );
+    }
+
+    #[test]
+    fn append_after_torn_tail_starts_a_new_line() {
+        let dir = temp_root("logging-torn-tail");
+        let file = dir.join("instance.log");
+        // 崩溃留下的半行没有换行符。
+        fs::write(&file, "第一行\n{\"torn\":true").unwrap();
+        let mut writer = LogWriter::open(file.clone(), 1024, 3).unwrap();
+        writer.append_line("新行").unwrap();
+        let text = fs::read_to_string(&file).unwrap();
+        assert_eq!(text, "第一行\n{\"torn\":true\n新行\n");
+        assert_eq!(text.lines().last(), Some("新行"));
     }
 
     #[test]
