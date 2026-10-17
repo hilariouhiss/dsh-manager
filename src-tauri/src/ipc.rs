@@ -9,8 +9,8 @@ use crate::AppState;
 use crate::error::{AppError, CmdResult};
 use crate::m0::diagnostics::{self, DiagnosticsInput};
 use crate::m0::logging;
-use crate::m0::oplog::{OplogEntry, OplogPage};
-use crate::m0::settings::{self, Settings};
+use crate::m0::oplog::{Oplog, OplogEntry, OplogPage};
+use crate::m0::settings::{self, Settings, SettingsStore};
 use crate::m1::channels::{ChannelsCache, by_id};
 use crate::m1::version_check::{
     AutoChannelSettings, CheckUpdatesReport, SharedOriginFacts, apply_auto_channel,
@@ -96,22 +96,21 @@ pub fn export_diagnostics(
     Ok(ExportResult { bytes_written })
 }
 
-/// §3.4 命令 2：设置自动安装通道，返回生效后的完整设置。
+/// `set_auto_channel` 的写入路径：校验、落盘并记一条设置变更记录（设计 §7.2）。
 ///
-/// 前端**必须**在调用本命令之前完成切换确认（FR-1.4）；命令本身不再弹确认。
-/// 写入路径：`apply_auto_channel` 算出实际要写的两个字段（单通道约束在这里生效），
-/// 再交给 `SettingsStore::apply_patch` 校验 + 立即落盘（§3.3.2 禁止自建落盘）。
-#[tauri::command]
-pub fn set_auto_channel(
+/// 与 `update_settings` 一致：新旧设置都交给 `settings::record_change`，
+/// 单独拆出来是为了能在没有 Tauri 应用的情况下测试「设置变更可追溯」。
+fn apply_auto_channel_settings(
+    store: &SettingsStore,
+    oplog: &Oplog,
     channel: Option<String>,
     enabled: bool,
-    state: State<'_, AppState>,
-) -> CmdResult<Settings> {
-    let snapshot = state.settings.snapshot();
+) -> CmdResult<(Settings, OplogEntry)> {
+    let before = store.snapshot();
     let current = AutoChannelSettings {
-        auto_channel: snapshot.auto_channel.clone(),
-        auto_install: snapshot.auto_install,
-        confirm_before_install: snapshot.confirm_before_install,
+        auto_channel: before.auto_channel.clone(),
+        auto_install: before.auto_install,
+        confirm_before_install: before.confirm_before_install,
     };
     let channel = channel.unwrap_or_default();
     if enabled && by_id(&channel).is_none() {
@@ -129,7 +128,33 @@ pub fn set_auto_channel(
         "autoChannel": next.auto_channel,
         "autoInstall": next.auto_install,
     });
-    let (applied, _problems) = state.settings.apply_patch(&patch)?;
+    let (applied, _problems) = store.apply_patch(&patch)?;
+    let entry = settings::record_change(
+        oplog,
+        store.file(),
+        &before,
+        &applied,
+        logging::oplog_policy(&applied),
+    )?;
+    Ok((applied, entry))
+}
+
+/// §3.4 命令 2：设置自动安装通道，返回生效后的完整设置。
+///
+/// 前端**必须**在调用本命令之前完成切换确认（FR-1.4）；命令本身不再弹确认。
+/// 写入路径：`apply_auto_channel` 算出实际要写的两个字段（单通道约束在这里生效），
+/// 再交给 `SettingsStore::apply_patch` 校验 + 立即落盘（§3.3.2 禁止自建落盘），
+/// 最后追加一条操作记录并推送 `oplog:entry`（设计 §7.2）。
+#[tauri::command]
+pub fn set_auto_channel(
+    app: AppHandle,
+    channel: Option<String>,
+    enabled: bool,
+    state: State<'_, AppState>,
+) -> CmdResult<Settings> {
+    let (applied, entry) =
+        apply_auto_channel_settings(&state.settings, &state.oplog, channel, enabled)?;
+    emit_oplog(&app, &entry);
     Ok(applied)
 }
 
@@ -209,5 +234,31 @@ mod tests {
                 "oplog:entry",
             ]
         );
+    }
+
+    #[test]
+    fn set_auto_channel_is_recorded_in_oplog() {
+        use crate::m0::paths::{DataPaths, temp_root};
+
+        let paths = DataPaths::under_root(&temp_root("ipc-auto-channel-oplog"));
+        paths.ensure_dirs().unwrap();
+        let store = SettingsStore::load_or_init(paths.settings_file()).unwrap();
+        let oplog = Oplog::new(paths.oplog_file());
+
+        let (first, first_entry) =
+            apply_auto_channel_settings(&store, &oplog, Some("latest".to_owned()), true).unwrap();
+        assert_eq!(first_entry.action, "settings.update");
+        assert_eq!(first.auto_channel.as_deref(), Some("latest"));
+
+        let (second, second_entry) =
+            apply_auto_channel_settings(&store, &oplog, Some("next".to_owned()), true).unwrap();
+        assert_eq!(second.auto_channel.as_deref(), Some("next"));
+        let raw = second_entry.raw.as_deref().expect("应含前后值");
+        assert!(raw.contains("\"latest\""), "旧通道应出现在记录中：{raw}");
+        assert!(raw.contains("\"next\""), "新通道应出现在记录中：{raw}");
+        assert!(raw.contains("→"), "应展示旧值 → 新值：{raw}");
+
+        let page = oplog.read_page(0, 10).unwrap();
+        assert_eq!(page.total, 2, "每次通道切换记一条");
     }
 }
