@@ -2,7 +2,13 @@ import { beforeEach, describe, expect, it, vi } from "vite-plus/test";
 import { createPinia, setActivePinia } from "pinia";
 
 const { invokeCmd } = vi.hoisted(() => ({ invokeCmd: vi.fn() }));
-vi.mock("../ipc/client", () => ({ invokeCmd }));
+vi.mock("../ipc/client", () => ({
+  invokeCmd,
+  isAppError: (value: unknown) =>
+    typeof value === "object" &&
+    value !== null &&
+    typeof (value as { code?: unknown }).code === "string",
+}));
 
 import {
   CHANNEL_OPTIONS,
@@ -300,13 +306,15 @@ describe("settings store", () => {
     store.autostart = { enabled: false, mode: "tray", entryPath: null };
     invokeCmd.mockImplementation((name: string) => {
       if (name === "set_autostart") {
-        return Promise.resolve({ enabled: true, mode: "tray", entryPath: "HKCU/.../dsh-manager" });
+        // 请求是「保持关闭、只改启动行为」，系统状态里 enabled 必须仍是 false
+        return Promise.resolve({ enabled: false, mode: "tray", entryPath: null });
       }
       if (name === "get_settings") return Promise.resolve({ ...DEFAULT_SETTINGS });
       return Promise.reject(new Error("未预期的命令：" + name));
     });
     await store.setAutostartMode("window");
     expect(store.autostart?.mode).toBe("tray");
+    expect(store.autostart?.enabled).toBe(false);
     expect(store.notSavedHint).toContain("最小化到托盘");
   });
 
@@ -354,5 +362,165 @@ describe("settings store", () => {
     });
     await store.setAutostartEnabled(true);
     expect(invokeCmd).toHaveBeenCalledWith("set_autostart", { enabled: true, mode: "window" });
+  });
+
+  it("系统未接受开启请求时明确提示原因与下一步", async () => {
+    const store = useSettingsStore();
+    store.settings = { ...DEFAULT_SETTINGS };
+    store.autostart = { enabled: false, mode: "tray", entryPath: null };
+    invokeCmd.mockImplementation((name: string) => {
+      // 系统忽略了写入：命令 14 仍是 Ok，但 enabled 与请求不符
+      if (name === "set_autostart") {
+        return Promise.resolve({ enabled: false, mode: "tray", entryPath: null });
+      }
+      if (name === "get_settings") return Promise.resolve({ ...DEFAULT_SETTINGS });
+      return Promise.reject(new Error("未预期的命令：" + name));
+    });
+    await store.setAutostartEnabled(true);
+    expect(store.autostart?.enabled, "界面必须显示系统真值").toBe(false);
+    expect(store.notSavedHint).toContain("系统未接受该更改");
+    expect(store.notSavedHint).toContain("请检查账户权限后重试");
+    expect(store.notSavedHint).toContain("导出诊断包");
+  });
+
+  it("自启状态读取失败后，成功的设置更新不得清掉失败状态", async () => {
+    const store = useSettingsStore();
+    const readError = {
+      code: "autostart.read_failed",
+      reason: "读取开机自启登录项状态失败。",
+      nextStep: "请确认当前账户可读取 HKCU 后重试。",
+      raw: "Access is denied. (os error 5)",
+      retryable: true,
+    };
+    invokeCmd.mockImplementation((name: string) => {
+      if (name === "get_settings") return Promise.resolve({ ...DEFAULT_SETTINGS });
+      if (name === "get_autostart_state") return Promise.reject(readError);
+      if (name === "update_settings") {
+        return Promise.resolve({ ...DEFAULT_SETTINGS, autoScroll: false });
+      }
+      return Promise.reject(new Error("未预期的命令：" + name));
+    });
+    await store.load();
+    expect(store.autostart, "读失败不等于已关闭，不得填入一个假状态").toBeNull();
+    expect(store.autostartError?.code).toBe("autostart.read_failed");
+
+    await store.update({ autoScroll: false });
+    expect(store.autostartError?.code, "成功的设置更新不得清掉自启读取失败").toBe(
+      "autostart.read_failed",
+    );
+  });
+
+  it("自启状态重新读取成功后清除读取失败状态", async () => {
+    const store = useSettingsStore();
+    invokeCmd.mockRejectedValue({
+      code: "autostart.read_failed",
+      reason: "读取开机自启登录项状态失败。",
+      nextStep: "请确认当前账户可读取 HKCU 后重试。",
+      raw: null,
+      retryable: true,
+    });
+    await store.refreshAutostart();
+    expect(store.autostartError?.code).toBe("autostart.read_failed");
+
+    invokeCmd.mockResolvedValue({ enabled: true, mode: "tray", entryPath: "HKCU/.../dsh-manager" });
+    await store.refreshAutostart();
+    expect(store.autostartError).toBeNull();
+    expect(store.autostart?.enabled).toBe(true);
+  });
+
+  it("设置读取失败不拖累自启状态读取（两者独立）", async () => {
+    const store = useSettingsStore();
+    invokeCmd.mockImplementation((name: string) => {
+      if (name === "get_settings") {
+        return Promise.reject({
+          code: "settings.corrupt",
+          reason: "设置文件无法解析，已回落到默认值。",
+          nextStep: "请在设置页重新确认各项后保存。",
+          raw: null,
+          retryable: false,
+        });
+      }
+      if (name === "get_autostart_state") {
+        return Promise.resolve({
+          enabled: true,
+          mode: "window",
+          entryPath: "HKCU/.../dsh-manager",
+        });
+      }
+      return Promise.reject(new Error("未预期的命令：" + name));
+    });
+    await store.load();
+    expect(store.settings).toBeNull();
+    expect(store.error?.code).toBe("settings.corrupt");
+    expect(store.autostart?.enabled, "设置读不到不影响系统自启状态显示").toBe(true);
+  });
+
+  it("命令 14 失败后重读设置，已落盘的启动行为要反映出来且不覆盖原始错误", async () => {
+    const store = useSettingsStore();
+    store.settings = { ...DEFAULT_SETTINGS };
+    store.autostart = { enabled: false, mode: "tray", entryPath: null };
+    invokeCmd.mockImplementation((name: string) => {
+      if (name === "set_autostart") {
+        return Promise.reject({
+          code: "autostart.denied",
+          reason: "写入登录项被系统拒绝。",
+          nextStep: "确认当前账户可以写入 HKCU 的 Run 项，然后重试。",
+          raw: "access denied",
+          retryable: false,
+        });
+      }
+      if (name === "get_autostart_state") {
+        return Promise.resolve({ enabled: false, mode: "window", entryPath: null });
+      }
+      if (name === "get_settings") {
+        return Promise.resolve({ ...DEFAULT_SETTINGS, autostartMode: "window" });
+      }
+      return Promise.reject(new Error("未预期的命令：" + name));
+    });
+    await store.setAutostartMode("window");
+    expect(store.error?.code, "原始失败原因不得被重读覆盖").toBe("autostart.denied");
+    expect(store.settings?.autostartMode, "命令 14 先落盘的启动行为要重新读出来").toBe("window");
+  });
+
+  it("命令 14 失败且重读状态也失败时，保留写入错误并另记读取失败", async () => {
+    const store = useSettingsStore();
+    store.settings = { ...DEFAULT_SETTINGS };
+    store.autostart = { enabled: true, mode: "tray", entryPath: "HKCU/.../dsh-manager" };
+    invokeCmd.mockImplementation((name: string) => {
+      if (name === "set_autostart") {
+        return Promise.reject({
+          code: "autostart.denied",
+          reason: "移除开机自启登录项被系统拒绝。",
+          nextStep: "请用同一个账户重试。",
+          raw: "access denied",
+          retryable: false,
+        });
+      }
+      if (name === "get_autostart_state") {
+        return Promise.reject({
+          code: "autostart.read_failed",
+          reason: "读取开机自启登录项状态失败。",
+          nextStep: "请确认当前账户可读取 HKCU 后重试。",
+          raw: null,
+          retryable: true,
+        });
+      }
+      if (name === "get_settings") return Promise.resolve({ ...DEFAULT_SETTINGS });
+      return Promise.reject(new Error("未预期的命令：" + name));
+    });
+    await store.setAutostartEnabled(false);
+    expect(store.error?.code, "写入的原始原因仍留在 error").toBe("autostart.denied");
+    expect(store.autostartError?.code, "失败后的重读失败单独记录").toBe("autostart.read_failed");
+  });
+
+  it("非 AppError 的失败也给出中文原因与下一步", async () => {
+    const store = useSettingsStore();
+    store.settings = { ...DEFAULT_SETTINGS };
+    invokeCmd.mockRejectedValue(new Error("boom"));
+    await store.update({ autoScroll: false });
+    expect(store.error?.code.length).toBeGreaterThan(0);
+    expect(store.error?.reason).toContain("未预期的错误");
+    expect(store.error?.nextStep).toContain("重试");
+    expect(store.error?.raw).toBe("boom");
   });
 });

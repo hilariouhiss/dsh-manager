@@ -12,7 +12,7 @@ import {
   type NumericKey,
   type SettingItem,
 } from "../stores/settings";
-import { ERROR_CODES } from "../ipc/types";
+import { syncChecked } from "../utils/dom";
 import type { AutostartMode, Settings } from "../ipc/types";
 
 const store = useSettingsStore();
@@ -67,6 +67,23 @@ async function commitValue(
   value: boolean | string | string[] | null,
 ): Promise<void> {
   await store.setValue(item.key, value);
+}
+
+/**
+ * 布尔开关：await 之后按 store 真值回写 DOM。
+ * 写入被拒时 store 真值没变，Vue 会跳过值未变的 checked 补丁，开关会停在用户点出来的状态。
+ */
+async function commitBoolean(item: SettingItem, event: Event): Promise<void> {
+  const el = event.target as HTMLInputElement;
+  await commitValue(item, el.checked);
+  syncChecked(el, Boolean(currentValue(item.key)));
+}
+
+/** 自启开关同理：以命令 14 返回的系统状态回写，失败时回到系统真相。 */
+async function onAutostartToggle(event: Event): Promise<void> {
+  const el = event.target as HTMLInputElement;
+  await store.setAutostartEnabled(el.checked);
+  syncChecked(el, store.autostart?.enabled ?? false);
 }
 
 async function commitNumber(item: SettingItem): Promise<void> {
@@ -135,10 +152,13 @@ const oplogTo = computed(() => oplogPage.value * oplogPageSize + store.oplogEntr
 const canOplogPrev = computed(() => oplogPage.value > 0);
 const canOplogNext = computed(() => (oplogPage.value + 1) * oplogPageSize < store.oplogTotal);
 
+/** 系统真实状态未知（还在读或读取失败）时，开关必须禁用，不能装成「已关闭」。 */
+const autostartKnown = computed(() => store.autostart !== null && store.autostartError === null);
+
 /** 自启开关下面那行必须说明「系统里现在到底是什么样」（FR-5.3）。 */
 const autostartHint = computed(() => {
-  if (store.error?.code === ERROR_CODES.AUTOSTART_READ_FAILED) {
-    return "无法读取系统登录项状态：开关显示的不是系统真实状态，请按上方提示处理后重试。";
+  if (store.autostartError !== null) {
+    return "无法读取系统登录项状态，请重试：开关已禁用，不会用本地配置冒充系统状态。";
   }
   if (store.autostart === null) return "正在读取系统登录项状态……";
   return store.autostart.enabled
@@ -199,10 +219,32 @@ const autostartHint = computed(() => {
               type="checkbox"
               data-testid="autostart-toggle"
               :checked="store.autostart?.enabled ?? false"
-              @change="store.setAutostartEnabled(($event.target as HTMLInputElement).checked)"
+              :disabled="!autostartKnown"
+              :indeterminate="!autostartKnown"
+              @change="onAutostartToggle"
             />
           </label>
           <p class="text-sm opacity-70" data-testid="autostart-state-hint">{{ autostartHint }}</p>
+          <div
+            v-if="store.autostartError !== null"
+            class="alert alert-error items-start"
+            role="alert"
+            data-testid="autostart-error"
+          >
+            <div class="flex flex-col gap-2">
+              <p class="font-medium">无法读取系统登录项状态，请重试。</p>
+              <p class="text-sm">原因：{{ store.autostartError.reason }}</p>
+              <p class="text-sm">下一步：{{ store.autostartError.nextStep }}</p>
+              <button
+                type="button"
+                class="btn btn-sm btn-outline w-fit"
+                data-testid="autostart-retry"
+                @click="store.refreshAutostart()"
+              >
+                重试读取
+              </button>
+            </div>
+          </div>
         </div>
 
         <label
@@ -222,7 +264,7 @@ const autostartHint = computed(() => {
             type="checkbox"
             :data-testid="'setting-' + item.key"
             :checked="Boolean(currentValue(item.key))"
-            @change="commitValue(item, ($event.target as HTMLInputElement).checked)"
+            @change="commitBoolean(item, $event)"
           />
 
           <span v-else-if="item.kind === 'number'" class="flex flex-col items-end">

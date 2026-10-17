@@ -4,7 +4,7 @@
 import { defineStore } from "pinia";
 import { ref } from "vue";
 
-import { invokeCmd } from "../ipc/client";
+import { invokeCmd, isAppError } from "../ipc/client";
 import type { AppError, AutostartMode, AutostartState, OplogEntry, Settings } from "../ipc/types";
 
 /** 数值项的取值区间（§3.7 校验规则）。后端用同一套区间兜底，两侧必须一致。 */
@@ -158,9 +158,28 @@ export function rejectedKeys(patch: Partial<Settings>, effective: Settings): str
   );
 }
 
+/**
+ * 把 catch 到的未知值收成 AppError。
+ *
+ * IPC 按契约只会抛 AppError；万一抛出别的东西，也要给出中文原因与下一步（NFR-1），
+ * 不能像以前的 `err as AppError` 那样让界面显示 undefined。
+ */
+function asAppError(err: unknown): AppError {
+  if (isAppError(err)) return err;
+  return {
+    code: "internal.unexpected",
+    reason: "操作未能完成：发生了未预期的错误，界面可能不是最新状态。",
+    nextStep: "请点「刷新」重试；若反复出现，请导出诊断包并附上其中的运行日志。",
+    raw: err instanceof Error ? err.message : String(err),
+    retryable: true,
+  };
+}
+
 export const useSettingsStore = defineStore("settings", () => {
   const settings = ref<Settings | null>(null);
   const autostart = ref<AutostartState | null>(null);
+  /** 自启状态的读取失败单独存放：它不得被后续成功的其它动作清掉（FR-5.3）。 */
+  const autostartError = ref<AppError | null>(null);
   const oplogEntries = ref<OplogEntry[]>([]);
   const oplogTotal = ref(0);
   const error = ref<AppError | null>(null);
@@ -168,26 +187,34 @@ export const useSettingsStore = defineStore("settings", () => {
   const notSavedHint = ref<string | null>(null);
 
   function remember(err: unknown): void {
-    error.value = err as AppError;
+    error.value = asAppError(err);
   }
 
-  async function load(): Promise<void> {
-    error.value = null;
-    notSavedHint.value = null;
+  async function readSettings(): Promise<void> {
     try {
       settings.value = await invokeCmd<Settings>("get_settings", {});
-      autostart.value = await invokeCmd<AutostartState>("get_autostart_state", {});
     } catch (err) {
       remember(err);
     }
   }
 
-  /** 只读刷新系统自启状态（FR-5.3：系统里改了状态，界面跟上）。 */
+  /** 设置与系统自启各自读、各自失败：一边读不到不影响另一边显示。 */
+  async function load(): Promise<void> {
+    error.value = null;
+    notSavedHint.value = null;
+    await Promise.all([readSettings(), refreshAutostart()]);
+  }
+
+  /**
+   * 只读刷新系统自启状态（FR-5.3：系统里改了状态，界面跟上）。
+   * 读取成功才清除失败状态；失败期间开关保持禁用，不显示成「已关闭」。
+   */
   async function refreshAutostart(): Promise<void> {
     try {
       autostart.value = await invokeCmd<AutostartState>("get_autostart_state", {});
+      autostartError.value = null;
     } catch (err) {
-      remember(err);
+      autostartError.value = asAppError(err);
     }
   }
 
@@ -248,23 +275,39 @@ export const useSettingsStore = defineStore("settings", () => {
       // 命令 14 是「开机自启」这一组的唯一写入口：它先落盘启动行为，再写系统登录项
       const state = await invokeCmd<AutostartState>("set_autostart", { enabled, mode });
       autostart.value = state;
+      // 命令 14 能返回状态，说明系统登录项这次读得到：清掉之前的读取失败状态。
+      autostartError.value = null;
+      // 命令 14 的出参形状由 §3.4 冻结，没有放「校验问题列表」的位置：
+      // 用「请求值 vs 实际生效值」把回落显示出来，原始中文说明由后端记进运行日志（NFR-1）。
+      const hints: string[] = [];
       if (state.mode !== mode) {
-        // 命令 14 的出参形状由 §3.4 冻结，没有放「校验问题列表」的位置：
-        // 用「请求值 vs 实际生效值」把回落显示出来，原始中文说明由后端记进运行日志（NFR-1）
-        notSavedHint.value =
+        hints.push(
           "启动行为未按所选生效，已回落为「" +
-          (state.mode === "tray" ? "最小化到托盘" : "打开主窗口") +
-          "」。请重新选择并保存；若反复回落，请导出诊断包并查看其中的运行日志。";
+            (state.mode === "tray" ? "最小化到托盘" : "打开主窗口") +
+            "」。请重新选择并保存；若反复回落，请导出诊断包并查看其中的运行日志。",
+        );
       }
+      if (state.enabled !== enabled) {
+        hints.push(
+          "系统未接受该更改：请求" +
+            (enabled ? "开启" : "关闭") +
+            "开机自启，但系统登录项仍为" +
+            (state.enabled ? "开启" : "关闭") +
+            "。请检查账户权限后重试；若反复出现请导出诊断包。",
+        );
+      }
+      notSavedHint.value = hints.length > 0 ? hints.join(" ") : null;
       settings.value = await invokeCmd<Settings>("get_settings", {});
     } catch (err) {
       remember(err);
       // 写入系统失败后登录项可能已部分改变：重读系统真实状态（FR-5.3），
-      // 不把失败当成「已关闭」，也不让重读失败覆盖本次操作的原始原因。
+      // 不把失败当成「已关闭」。重读失败记进独立的读取失败状态，本次写入原因仍留在 error 里。
+      await refreshAutostart();
       try {
-        autostart.value = await invokeCmd<AutostartState>("get_autostart_state", {});
+        // 命令 14 先落盘启动行为再写系统：系统写入失败时 mode 可能已经生效
+        settings.value = await invokeCmd<Settings>("get_settings", {});
       } catch {
-        // 保留原始失败原因
+        // 同上：设置重读失败不覆盖本次写入的失败原因
       }
     }
   }
@@ -315,6 +358,7 @@ export const useSettingsStore = defineStore("settings", () => {
   return {
     settings,
     autostart,
+    autostartError,
     oplogEntries,
     oplogTotal,
     error,
