@@ -1,3 +1,6 @@
+pub mod error;
+pub mod ipc;
+
 /// 装配点托管的统一状态。**字段名与顺序按主计划 §3.3.2 冻结**：后续每条任务线只往这个
 /// 结构体里追加自己那一行，不改形状、不改名、不删已有字段。完整顺序：
 /// 1 `settings: Arc<SettingsStore>`（T-S3）· 2 `oplog: Arc<Oplog>`（T-S5）·
@@ -21,6 +24,7 @@ pub fn run() {
             None,
         ))
         .plugin(tauri_plugin_log::Builder::new().build())
+        .invoke_handler(tauri::generate_handler![ipc::ping])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
