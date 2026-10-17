@@ -79,6 +79,22 @@ mod tests {
         assert!(probe.is_alive(std::process::id()), "当前进程必须被判为存活");
     }
 
+    /// 钉住刷新集必须包含 cmd：便捷方法 refresh_processes 不刷新命令行（cmd 默认 Never），
+    /// 一旦退回它，本测试失败——否则 list_instances 会静默地永远返回空数组。
+    #[test]
+    fn snapshot_refreshes_command_lines() {
+        let snapshot = SysinfoProbe::new().snapshot().expect("进程枚举不得失败");
+        let me = snapshot
+            .iter()
+            .find(|p| p.pid == std::process::id())
+            .expect("快照必须包含当前测试进程");
+        assert!(!me.cmdline.is_empty(), "当前进程的命令行不得为空：{me:?}");
+        assert!(
+            snapshot.iter().any(|p| !p.cmdline.is_empty()),
+            "快照中至少要有一个进程能读到命令行"
+        );
+    }
+
     #[test]
     fn is_alive_reports_unknown_pid_as_dead() {
         let probe = SysinfoProbe::new();
