@@ -307,7 +307,7 @@ describe("version store 的刷新、安装与事件订阅", () => {
     expect(store.installing).toBeNull();
   });
 
-  it("自动安装失败后仍刷新检查结果，失败原因保留给界面", async () => {
+  it("自动安装失败时不刷新检查结果，失败原因保留给界面（避免自触发安装循环）", async () => {
     const store = useVersionStore();
     const report = {
       channels: [],
@@ -335,8 +335,10 @@ describe("version store 的刷新、安装与事件订阅", () => {
       version: "0.2.1-alpha.4",
       needsConfirm: false,
     });
-    await vi.waitFor(() => expect(store.report).toEqual(report));
-    expect(store.installError).toEqual(failure);
+    await vi.waitFor(() => expect(store.installError).toEqual(failure));
+    // 失败/取消时本机版本未变：刷新会立刻再次收到 update:available，形成自动安装循环。
+    expect(invokeCmd.mock.calls.map((call) => call[0])).toEqual(["start_install"]);
+    expect(store.report).toBeNull();
     expect(store.installing).toBeNull();
   });
 
@@ -368,7 +370,7 @@ describe("version store 的刷新、安装与事件订阅", () => {
     await first;
   });
 
-  it("安装进行中收到 update:available 不再发起第二个安装", async () => {
+  it("安装进行中收到 update:available 不落状态、不发起第二个安装（不会弹出空确认框）", async () => {
     const store = useVersionStore();
     await store.listenForUpdates();
     store.installing = {
@@ -380,9 +382,11 @@ describe("version store 的刷新、安装与事件订阅", () => {
     handlers.get("update:available")?.({
       channel: "alpha",
       version: "0.2.1-alpha.4",
-      needsConfirm: false,
+      needsConfirm: true,
     });
     await Promise.resolve();
+    // 视图 watch(store.available) 才会弹确认框：安装中不落状态，空操作的确认框不会出现。
+    expect(store.available).toBeNull();
     expect(invokeCmd).not.toHaveBeenCalled();
     expect(store.installing?.taskId).toBe("install-1");
   });

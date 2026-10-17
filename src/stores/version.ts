@@ -155,10 +155,14 @@ export const useVersionStore = defineStore("version", {
     /** 注册 update:available 监听；返回注销函数（§3.5 订阅约束）。 */
     async listenForUpdates(): Promise<() => void> {
       return on<UpdateAvailablePayload>(EVENTS.EVENT_UPDATE_AVAILABLE, (payload) => {
+        // 安装进行中：不得再起第二个安装，也不得改写 available——视图据它弹确认框，
+        // 安装中弹出的确认框只会被互斥挡成空操作。
+        if (this.installing !== null) {
+          return;
+        }
         this.available = payload;
         // needsConfirm=false（用户关闭了安装前确认）时直接进入安装（FR-1.4）。
-        // 安装进行中不得再起第二个安装。
-        if (payload.needsConfirm || this.installing !== null) {
+        if (payload.needsConfirm) {
           return;
         }
         void (async () => {
@@ -166,8 +170,10 @@ export const useVersionStore = defineStore("version", {
             await this.startInstall(payload.channel, payload.version);
           } catch {
             // 失败已落进 installError，自动安装没有可点的发起入口，界面统一展示它。
+            // 失败/取消时本机版本未变：刷新会立刻再次收到 update:available，自触发下一轮安装。
+            return;
           }
-          // 成功时本机版本已变、失败时结论也应保持最新，两条路径都刷新。
+          // 只有安装成功才刷新：本机版本已变，取回新版本与结论。
           await this.refresh().catch(() => {});
         })();
       });
