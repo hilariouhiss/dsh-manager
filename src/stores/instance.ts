@@ -98,6 +98,14 @@ export const useInstanceStore = defineStore("instance", () => {
     }
   }
 
+  /**
+   * 首个未持有的序号。视图必须在订阅/任何 await **之前**取它：晚一步，
+   * 订阅期间到达的实时行会把 lastSeq 推到卸载期间缺失的那一段之后。
+   */
+  function firstMissingSeq(): number {
+    return lastSeq.value + 1;
+  }
+
   function togglePause(): void {
     pausedAt.value = pausedAt.value === null ? lines.value.length : null;
     paused.value = pausedAt.value !== null;
@@ -126,18 +134,21 @@ export const useInstanceStore = defineStore("instance", () => {
     paused.value = false;
   }
 
+  /** 清空并归零回填游标：新一次运行的输出序号从 0 重新开始。 */
+  function resetOutput(): void {
+    clear();
+    lastSeq.value = -1;
+    nextSeq.value = 0;
+    truncated.value = false;
+  }
+
   /**
    * 启动前清掉上一轮的行。有实例在跑时**不清**：后端会以 instance.already_running
    * 拒绝启动，清掉只会把在跑实例的实时输出抹掉，且没有回填。
-   * 新实例的输出序号从 0 重新开始，因此这里必须把回填游标一并归零。
+   * 列表可能过期，所以启动成功后还必须再 resetOutput() 一次（见 InstanceView.start）。
    */
   function clearForStart(): void {
-    if (instances.value.length === 0) {
-      clear();
-      lastSeq.value = -1;
-      nextSeq.value = 0;
-      truncated.value = false;
-    }
+    if (instances.value.length === 0) resetOutput();
   }
 
   function select(instanceId: string | null): void {
@@ -165,24 +176,35 @@ export const useInstanceStore = defineStore("instance", () => {
     for (const line of [...kept, ...page.lines]) bySeq.set(line.seq, line);
     lines.value = [...bySeq.values()].sort((a, b) => a.seq - b.seq);
     lastSeq.value = lines.value.length === 0 ? -1 : lines.value[lines.value.length - 1].seq;
-    nextSeq.value = page.nextSeq;
+    // 快照会落后于实时事件：nextSeq 只增不减，否则会被旧快照拨回去。
+    nextSeq.value = Math.max(nextSeq.value, page.nextSeq);
     truncated.value = page.truncated;
   }
 
   /**
    * 回填选中实例的输出（命令 9）：视图重挂载或实例状态变化时补齐离线期间的行。
+   * `fromSeq` 默认取首个缺失序号，但重挂载路径必须传挂载前算好的值——订阅期间
+   * 到达的实时行会推进 lastSeq，事后再算就会把卸载期间缺的那一段跳过去（FR-3.2）。
+   * 逐页取到快照末尾或没有更多行为止，mergePage 按 seq 去重并保持顺序。
    * 外部实例后端拿不到输出，直接跳过，不用空内容冒充「没有输出」（设计文档 §2.4 边界 2）。
    */
-  async function backfillOutput(): Promise<void> {
+  async function backfillOutput(fromSeq = firstMissingSeq()): Promise<void> {
     const instance = selected.value;
     if (instance === null || !instance.managed) return;
+    let cursor = fromSeq;
     try {
-      const page = await invokeCmd<ListOutputResult>("list_output", {
-        instanceId: instance.instanceId,
-        fromSeq: lastSeq.value + 1,
-      });
-      mergePage(page);
-      error.value = null;
+      for (;;) {
+        const page = await invokeCmd<ListOutputResult>("list_output", {
+          instanceId: instance.instanceId,
+          fromSeq: cursor,
+        });
+        mergePage(page);
+        const next = lastSeq.value + 1;
+        // 并到快照末尾、没有更多行，或游标不再前进（防死循环）即完成。
+        if (page.lines.length === 0 || next >= page.nextSeq || next <= cursor) break;
+        cursor = next;
+      }
+      // 成功不回写 error：它可能来自先前的 refresh 失败，回填成功不证明那次已恢复。
     } catch (e) {
       error.value = asAppError(e);
     }
@@ -341,6 +363,8 @@ export const useInstanceStore = defineStore("instance", () => {
     setAutoOpenBrowser,
     clear,
     clearForStart,
+    resetOutput,
+    firstMissingSeq,
     select,
     refresh,
     loadSettings,

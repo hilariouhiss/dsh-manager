@@ -34,6 +34,7 @@ import type {
   InstanceInfo,
   InstanceOutputPayload,
   InstanceUrlPayload,
+  ListOutputResult,
   OutputLine,
   Settings,
   StopResult,
@@ -44,6 +45,15 @@ const { handlers, invokeCmd, on, offs, openUrl } = mocks;
 
 function line(seq: number, text: string, isStderr = false): OutputLine {
   return { seq, timestampMs: 1_700_000_000_000 + seq, text, isStderr };
+}
+
+/** 手动控制何时返回的 Promise：用来复现「回填的 await 期间实时行到达」的竞态。 */
+function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
+  let resolve: (value: T) => void = () => {};
+  const promise = new Promise<T>((r) => {
+    resolve = r;
+  });
+  return { promise, resolve };
 }
 
 function info(instanceId: string, managed: boolean, url = "http://127.0.0.1:3080"): InstanceInfo {
@@ -165,6 +175,31 @@ describe("instance store 的输出缓冲", () => {
     expect(store.lines).toHaveLength(0);
   });
 
+  it("启动成功时即使列表还是旧的也重置游标：新一轮 seq 0 照常显示", () => {
+    const store = useInstanceStore();
+    // 列表还留着上一轮实例（尚未刷新）：clearForStart 的单实例判断会漏清。
+    store.instances = [info("stale-1", true)];
+    store.appendLine(line(0, "old-0"));
+    store.appendLine(line(5, "old-5"));
+    store.flushNow();
+    store.clearForStart();
+    expect(store.lines, "有实例在列表里时不能清，避免误伤在跑实例").toHaveLength(2);
+    expect(store.lastSeq).toBe(5);
+
+    // start_instance 成功之后无条件重置：新一次运行的序号从 0 重新开始。
+    store.resetOutput();
+    expect(store.lines).toHaveLength(0);
+    expect(store.lastSeq).toBe(-1);
+    expect(store.nextSeq).toBe(0);
+    expect(store.truncated).toBe(false);
+
+    // 旧游标若还在，seq 0 会被 appendLine 的 seq<=lastSeq 守卫丢掉。
+    store.appendLine(line(0, "new-0"));
+    store.flushNow();
+    expect(store.lines.map((l) => l.text)).toEqual(["new-0"]);
+    expect(store.lastSeq).toBe(0);
+  });
+
   it("truncated 时整体替换缓冲而不是追加", async () => {
     invokeCmd.mockResolvedValue({ lines: [line(9, "x")], nextSeq: 10, truncated: true });
     const store = useInstanceStore();
@@ -198,31 +233,88 @@ describe("instance store 的输出回填（视图重挂载后补齐离线期间�
     const store = useInstanceStore();
     store.instances = [info("inst-1", true)];
     store.select("inst-1");
+
+    // 视图挂载：先取首个缺失序号，回填的 await 期间实时行才到达。
+    const fromSeq = store.firstMissingSeq();
+    const page = deferred<ListOutputResult>();
+    invokeCmd.mockImplementation((name: string) =>
+      name === "list_output" ? page.promise : Promise.resolve([]),
+    );
+
+    const backfill = store.backfillOutput(fromSeq);
     store.appendLine(line(0, "live-0"));
     store.appendLine(line(2, "live-2"));
     store.flushNow();
-    invokeCmd.mockResolvedValue({
-      lines: [line(1, "back-1"), line(2, "live-2")],
-      nextSeq: 3,
-      truncated: false,
-    });
-
-    await store.backfillOutput();
+    page.resolve({ lines: [line(0, "back-0"), line(1, "back-1")], nextSeq: 2, truncated: false });
+    await backfill;
 
     expect(invokeCmd).toHaveBeenCalledWith("list_output", {
       instanceId: "inst-1",
-      fromSeq: 3,
+      fromSeq: 0,
     });
     expect(store.lines.map((l) => l.seq)).toEqual([0, 1, 2]);
-    expect(store.lines.map((l) => l.text)).toEqual(["live-0", "back-1", "live-2"]);
+    expect(store.lines.map((l) => l.text)).toEqual(["back-0", "back-1", "live-2"]);
 
     // 回填之后事件又重放了同一序号：不得重复并入。
     store.appendLine(line(2, "直播重放"));
     store.flushNow();
-    expect(store.lines.map((l) => l.text)).toEqual(["live-0", "back-1", "live-2"]);
+    expect(store.lines.map((l) => l.text)).toEqual(["back-0", "back-1", "live-2"]);
     expect(store.lastSeq).toBe(2);
     expect(store.nextSeq).toBe(3);
     expect(store.truncated).toBe(false);
+  });
+
+  it("回填用挂载时的首个缺失序号：回填期间到达的实时 seq 10 不会顶掉缺的 5-9", async () => {
+    const store = useInstanceStore();
+    store.instances = [info("inst-1", true)];
+    store.select("inst-1");
+    for (let seq = 0; seq <= 4; seq += 1) store.appendLine(line(seq, "away-" + seq));
+    store.flushNow();
+
+    // 视图重挂载：订阅之前先记下首个缺失序号（旧实现等订阅/刷新后才算，会算成 11）。
+    const fromSeq = store.firstMissingSeq();
+    expect(fromSeq).toBe(5);
+
+    const page = deferred<ListOutputResult>();
+    invokeCmd.mockImplementation((name: string) =>
+      name === "list_output" ? page.promise : Promise.resolve([]),
+    );
+
+    const backfill = store.backfillOutput(fromSeq);
+    // 回填还没返回，实时 seq 10 到达：lastSeq 被推到 10，缺失区间仍是 5-9。
+    store.appendLine(line(10, "live-10"));
+    store.flushNow();
+    expect(store.lastSeq).toBe(10);
+
+    // 后端契约：只返回 seq >= fromSeq 的行（5-9），实时 10 由事件通道交付。
+    const backend = Array.from({ length: 10 }, (_, seq) => line(seq, "out-" + seq));
+    page.resolve({
+      lines: backend.filter((l) => l.seq >= fromSeq),
+      nextSeq: 10,
+      truncated: false,
+    });
+    await backfill;
+
+    expect(invokeCmd).toHaveBeenCalledWith("list_output", {
+      instanceId: "inst-1",
+      fromSeq: 5,
+    });
+    expect(store.lines.map((l) => l.seq)).toEqual([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+    expect(store.lines.map((l) => l.text)).toEqual([
+      "away-0",
+      "away-1",
+      "away-2",
+      "away-3",
+      "away-4",
+      "out-5",
+      "out-6",
+      "out-7",
+      "out-8",
+      "out-9",
+      "live-10",
+    ]);
+    expect(store.lastSeq).toBe(10);
+    expect(store.nextSeq, "实时 10 已见过，下一个期望仍是 11").toBe(11);
   });
 
   it("分页从 lastSeq+1 继续；truncated 时按当前缓冲整体重建", async () => {
@@ -297,6 +389,27 @@ describe("instance store 的输出回填（视图重挂载后补齐离线期间�
       fromSeq: 0,
     });
     expect(store.lines.map((l) => l.text)).toEqual(["hello"]);
+  });
+
+  it("回填成功不清掉此前 refresh 失败留下的错误", async () => {
+    const store = useInstanceStore();
+    store.instances = [info("inst-1", true)];
+    store.select("inst-1");
+    invokeCmd.mockImplementation((name: string) => {
+      if (name === "list_instances") {
+        return Promise.reject(appError(ERROR_CODES.PATH_PERMISSION_DENIED, false));
+      }
+      return Promise.resolve({ lines: [], nextSeq: 0, truncated: false });
+    });
+
+    await store.refresh();
+    expect(store.error?.code).toBe(ERROR_CODES.PATH_PERMISSION_DENIED);
+
+    await store.backfillOutput();
+
+    expect(store.error?.code, "回填成功不代表刷新失败已经恢复").toBe(
+      ERROR_CODES.PATH_PERMISSION_DENIED,
+    );
   });
 });
 

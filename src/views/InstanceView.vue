@@ -39,14 +39,17 @@ let lastStop: { instance: InstanceInfo; force: boolean } | null = null;
 let off: (() => void) | null = null;
 
 onMounted(async () => {
+  // 先记下首个缺失序号，再订阅：订阅/刷新期间到达的实时行会推进 lastSeq，
+  // 事后再算就会从缺失区间之后开始回填，卸载期间的行永远补不回来（FR-3.2）。
+  const fromSeq = store.firstMissingSeq();
   off = await store.subscribe();
   // autoOpenBrowser 是设置项，进页面先读一次（FR-3.3）。
   await store.loadSettings();
   // 工作目录预填设置里的值；留空时后端也会回落（FR-3.1）。
   workDir.value = store.defaultWorkDir;
   await store.refresh();
-  // 视图卸载期间到达的行仍在后端环形缓冲里：重挂载时按 lastSeq+1 回填（FR-3.2 输出连续）。
-  await store.backfillOutput();
+  // 视图卸载期间到达的行仍在后端环形缓冲里：按挂载时记下的游标回填。
+  await store.backfillOutput(fromSeq);
 });
 
 onUnmounted(() => {
@@ -84,10 +87,13 @@ async function start(): Promise<void> {
       args,
       workDir: workDir.value,
     });
+    // 列表可能还没刷新（例如仍留着上一轮实例），clearForStart 就漏清了；
+    // 启动成功说明新一次运行的序号从 0 开始，无条件重置游标，否则 seq 0 会被去重丢掉。
+    store.resetOutput();
     store.select(started.instanceId);
     await store.refresh();
-    // 启动宽限窗口内的输出可能早于本轮订阅到达（如启动失败前的报错），补一次。
-    await store.backfillOutput();
+    // 新一次运行从头回填：事件与回填按 seq 去重，不会重复渲染。
+    await store.backfillOutput(0);
   } catch (e) {
     startError.value = asAppError(e);
     // 启动失败也可能留下状态事件，列表以事实为准（不静默另起）。
