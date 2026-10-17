@@ -47,7 +47,7 @@ export interface NavItem {
 export const routes: RouteRecordRaw[] = [
   { path: "/", redirect: { name: "version" } },
   ...viewRoutes,
-  { path: "/:pathMatch(.*)*", redirect: { name: "version" } },
+  { path: "/:pathMatch(.*)*", redirect: "/version" },
 ];
 
 /** 导航项由路由表生成，不另维护一份标签清单。 */
