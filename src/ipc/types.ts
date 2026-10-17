@@ -246,3 +246,13 @@ export interface StopResult {
   residualPids: number[];
   forced: boolean;
 }
+
+/**
+ * get_autostart_state / set_autostart 的出参（主计划 §3.4 命令 13/14）。
+ * enabled 一律来自系统真实状态（FR-5.3）；entryPath 仅在已开启时非空。
+ */
+export interface AutostartState {
+  enabled: boolean;
+  mode: AutostartMode;
+  entryPath: string | null;
+}

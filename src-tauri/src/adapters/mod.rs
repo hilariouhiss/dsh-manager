@@ -1,5 +1,6 @@
 //! 适配层：唯一接触外部世界的地方。应用层不得 use 本模块（设计文档 §2.3）。
 
+pub mod autostart_sys;
 pub mod bun;
 pub mod npm;
 pub mod npm_registry;

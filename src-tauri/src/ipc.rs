@@ -25,6 +25,7 @@ use crate::m1::version_check::{
 };
 use crate::m2::origin_detect::{self, OriginPaths, PER_SOURCE_TIMEOUT};
 use crate::m3::instance_discovery::InstanceLister;
+use crate::m4::autostart::{self, AutostartMode, AutostartState};
 use crate::ports::package_manager::{PackageManager, PmInfo};
 use crate::ports::registry::ChannelProbe;
 
@@ -80,6 +81,43 @@ pub fn update_settings(
     }
     emit_oplog(&app, &entry);
     Ok(next)
+}
+
+/// 命令 13：读取系统真实自启状态（§3.4）。无入参；启动行为取自设置（§3.7 autostartMode）。
+///
+/// 设置走 §3.3.2 冻结的 `SettingsStore::snapshot()`（返回克隆，不持锁）。
+/// 读取失败返回 autostart.read_failed（可重试），**不返回「已关闭」**（§3.2、FR-5.3）。
+#[tauri::command]
+pub fn get_autostart_state(state: State<'_, AppState>) -> CmdResult<AutostartState> {
+    autostart::get_state(
+        state.autostart.as_ref(),
+        state.settings.snapshot().autostart_mode,
+    )
+}
+
+/// 命令 14：写入系统登录项并回读系统真实状态（§3.4）。
+///
+/// 启动行为是设置项（§3.7 autostartMode），所以这是「开机自启」这一组的**唯一写入口**：
+/// 先用 §3.3.2 冻结的 `SettingsStore::apply_patch(&serde_json::Value)` 落盘（它内部逐字段校验并
+/// 立即写文件），再写系统。
+///
+/// `apply_patch` 返回的是 `(实际生效的 Settings, 校验问题的中文说明列表)`：
+/// - 实际生效值必须被采用（而不是回显请求值）——越界/类型不符时后端会回落；
+/// - 问题列表**不能丢**：命令 14 的出参形状由 §3.4 冻结（enabled/mode/entryPath），没有放列表的位置，
+///   所以这里记一条运行日志，并把**实际生效的 mode** 通过出参交给界面；界面比较请求值与生效值，
+///   不一致时给出「原因 + 下一步」（见 T-U1 的 writeAutostart）。
+#[tauri::command]
+pub fn set_autostart(
+    state: State<'_, AppState>,
+    enabled: bool,
+    mode: AutostartMode,
+) -> CmdResult<AutostartState> {
+    let patch = serde_json::json!({ "autostartMode": mode });
+    let (saved, issues) = state.settings.apply_patch(&patch)?;
+    if !issues.is_empty() {
+        log::warn!("启动行为补丁未完全生效：{}", issues.join("；"));
+    }
+    autostart::set_state(state.autostart.as_ref(), enabled, saved.autostart_mode)
 }
 
 /// 命令 16：分页读取操作记录（最新在前）。

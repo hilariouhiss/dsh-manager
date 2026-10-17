@@ -5,6 +5,7 @@ pub mod m0;
 pub mod m1;
 pub mod m2;
 pub mod m3;
+pub mod m4;
 pub mod ports;
 
 use std::sync::Arc;
@@ -32,6 +33,7 @@ use crate::m3::instance_runner::{
     InstanceUrlPayload,
 };
 use crate::m3::output_buffer::OutputLine;
+use crate::m4::autostart::AutostartPort;
 use crate::ports::package_manager::PackageManager;
 use crate::ports::process::ProcessProbe;
 use crate::ports::registry::RegistrySource;
@@ -52,6 +54,7 @@ pub struct AppState {
     pub process_probe: Arc<dyn ProcessProbe>,
     pub lister: Arc<dyn InstanceLister>,
     pub runner: Arc<InstanceRunner>,
+    pub autostart: Arc<dyn AutostartPort>,
     pub paths: DataPaths,
 }
 
@@ -267,10 +270,12 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_autostart::init(
-            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
-            None,
-        ))
+        // 登录项里写固定的启动参数；启动行为由 settings.autostartMode 决定（见子计划 §0.2）
+        .plugin(
+            tauri_plugin_autostart::Builder::new()
+                .arg(m4::autostart::LOGIN_ENTRY_ARG)
+                .build(),
+        )
         .plugin(tauri_plugin_log::Builder::new().build())
         .on_window_event(|window, event| {
             let tauri::WindowEvent::CloseRequested { api, .. } = event else {
@@ -384,6 +389,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             ipc::get_settings,
             ipc::update_settings,
+            ipc::get_autostart_state,
+            ipc::set_autostart,
             ipc::list_oplog,
             ipc::export_diagnostics,
             ipc::check_updates,
@@ -462,6 +469,10 @@ pub fn run() {
                 process_probe,
                 lister,
                 runner,
+                // M4 的登录项端口：命令 13/14 通过它读写系统（适配器只在装配点出现）
+                autostart: Arc::new(crate::adapters::autostart_sys::SysAutostart::new(
+                    app.handle().clone(),
+                )),
                 paths,
             });
 
