@@ -1439,6 +1439,55 @@ mod tests {
         );
     }
 
+    /// 命令 10：导出的是完整日志文件，且必须回报写入字节数。
+    #[test]
+    fn export_output_copies_the_log_file() {
+        let dir = temp_dir("export");
+        let (runner, _emitter) = recording_runner();
+        std::fs::write(dir.join("entry.log"), "[1] hello\n[2] world\n").unwrap();
+        runner.insert(test_entry(runner.managed_registry(), "inst-e", 9000, &dir));
+        let target = dir.join("exported.log");
+
+        let bytes = export_output(&runner, "inst-e", &target).unwrap();
+
+        assert!(bytes > 0, "必须回报写入字节数");
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "[1] hello\n[2] world\n"
+        );
+    }
+
+    /// 外部实例没有可导出的日志，必须报 instance.not_managed 而不是写空文件。
+    #[test]
+    fn export_output_rejects_instances_this_tool_did_not_start() {
+        let dir = temp_dir("export-external");
+        let (runner, _emitter) = recording_runner();
+        let err = export_output(&runner, "pid-4242", &dir.join("x.log")).unwrap_err();
+        assert_eq!(err.code, crate::error::INSTANCE_NOT_MANAGED);
+        assert!(
+            err.next_step.contains("本工具启动"),
+            "下一步要可操作：{}",
+            err.next_step
+        );
+    }
+
+    /// 登记项还在、日志文件尚未产生时也不能导出空文件。
+    #[test]
+    fn export_output_reports_a_missing_log_file() {
+        let dir = temp_dir("export-missing");
+        let (runner, _emitter) = recording_runner();
+        runner.insert(test_entry(runner.managed_registry(), "inst-m", 9001, &dir));
+
+        let err = export_output(&runner, "inst-m", &dir.join("x.log")).unwrap_err();
+
+        assert_eq!(err.code, crate::error::INSTANCE_NOT_MANAGED);
+        assert!(
+            err.reason.contains("日志文件"),
+            "原因要说明缺什么：{}",
+            err.reason
+        );
+    }
+
     #[tokio::test]
     async fn taskkill_records_the_gentle_then_forced_order() {
         let kill = TaskKill::recording();
@@ -2802,4 +2851,34 @@ pub fn take_startup_notice(marker: &Path) -> CmdResult<Vec<UnstoppableInstance>>
     })?;
     let _ = std::fs::remove_file(marker);
     Ok(serde_json::from_str(&text).unwrap_or_default())
+}
+
+/// 命令 10：把实例日志导出到用户选定的路径。
+///
+/// 导出的是**日志文件**而不是内存缓冲：环形缓冲会被挤出，日志文件才是完整的（§3.6 双写）。
+pub fn export_output(runner: &InstanceRunner, instance_id: &str, target: &Path) -> CmdResult<u64> {
+    let entry = runner.get(instance_id).ok_or_else(|| {
+        AppError::new(
+            crate::error::INSTANCE_NOT_MANAGED,
+            format!("实例 {instance_id} 不是由本工具启动，没有可导出的输出"),
+            "外部实例的输出无法获取；如果要导出日志，请用本工具启动一个实例。",
+        )
+    })?;
+
+    if !entry.log_path.is_file() {
+        return Err(AppError::new(
+            crate::error::INSTANCE_NOT_MANAGED,
+            format!("实例 {instance_id} 还没有产生日志文件"),
+            "等实例产生一些输出之后再导出。",
+        ));
+    }
+
+    std::fs::copy(&entry.log_path, target).map_err(|e| {
+        AppError::new(
+            crate::error::PATH_PERMISSION_DENIED,
+            format!("无法写出日志文件：{}", target.display()),
+            "换一个可写的位置（例如桌面或文档目录）后重试。",
+        )
+        .with_raw(e.to_string())
+    })
 }

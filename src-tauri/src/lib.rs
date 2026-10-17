@@ -192,6 +192,21 @@ fn list_output(
     })
 }
 
+/// §3.4 命令 10：把实例日志导出到用户选定的路径，返回写入字节数。
+#[tauri::command]
+fn export_output(
+    state: tauri::State<'_, AppState>,
+    instance_id: String,
+    target_path: String,
+) -> CmdResult<ipc::ExportResult> {
+    let bytes_written = instance_runner::export_output(
+        state.runner.as_ref(),
+        &instance_id,
+        std::path::Path::new(&target_path),
+    )?;
+    Ok(ipc::ExportResult { bytes_written })
+}
+
 /// §3.4 命令 5：识别本机 DSH 的安装来源，返回四值结论与依据清单。
 ///
 /// 同一次探测同时写回 `SharedOriginFacts`：版本页不必先访问「安装来源」页，
@@ -379,7 +394,8 @@ pub fn run() {
             detect_origin,
             start_instance,
             stop_instance,
-            list_output
+            list_output,
+            export_output
         ])
         .setup(|app| {
             let paths = DataPaths::resolve(app.handle())
