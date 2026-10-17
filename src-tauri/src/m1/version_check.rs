@@ -153,7 +153,9 @@ pub struct CheckUpdatesReport {
 }
 
 /// 自动安装提示（§3.5 事件 update:available 的载荷来源，判定在 T-V4）。
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// 直接作为事件载荷序列化：字段名由 camelCase 冻结为 channel / version / needsConfirm。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct UpdateNotice {
     pub channel: String,
     pub version: String,
@@ -373,6 +375,78 @@ pub fn update_notice(
         version: remote?.to_string(),
         needs_confirm: confirm_before_install,
     })
+}
+
+/// 与自动安装通道相关的三个设置项（§3.7 的子集，字段名与设置文件一致）。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AutoChannelSettings {
+    pub auto_channel: Option<String>,
+    pub auto_install: bool,
+    pub confirm_before_install: bool,
+}
+
+impl Default for AutoChannelSettings {
+    fn default() -> Self {
+        Self {
+            auto_channel: None,
+            auto_install: false,
+            confirm_before_install: true,
+        }
+    }
+}
+
+/// 单通道约束（FR-1.4）：开启某通道时**自动关闭其它通道**；未知通道标识不改动任何设置。
+///
+/// 只返回「生效后的设置」，不落盘——落盘由设置存储负责（T-S3）。
+pub fn apply_auto_channel(
+    current: &AutoChannelSettings,
+    channel: &str,
+    enabled: bool,
+) -> AutoChannelSettings {
+    let mut next = current.clone();
+    if enabled {
+        if by_id(channel).is_none() {
+            return next;
+        }
+        next.auto_channel = Some(channel.to_string());
+        next.auto_install = true;
+    } else if current.auto_channel.as_deref() == Some(channel) {
+        next.auto_channel = None;
+        next.auto_install = false;
+    }
+    next
+}
+
+/// 切换通道是否需要用户先确认：**目标通道与当前通道不同**才需要（FR-1.4「切换时需确认」）。
+pub fn switch_needs_confirm(current: &AutoChannelSettings, channel: &str) -> bool {
+    current.auto_install && current.auto_channel.as_deref() != Some(channel)
+}
+
+/// update:available 的完整判定：自动安装开启、通道匹配且已发布、远端版本严格更高。
+///
+/// 版本比较只走 T-V2 的 verdict（semver），不得退化成字符串比较；结果不适用时不出事件。
+pub fn auto_install_notice(
+    settings: &AutoChannelSettings,
+    local: Option<&semver::Version>,
+    applicable: bool,
+    channels: &[ChannelStatus],
+) -> Option<UpdateNotice> {
+    if !settings.auto_install {
+        return None;
+    }
+    let channel = settings.auto_channel.as_deref()?;
+    // 只认本次报告里所选通道的已发布版本，不拿其它通道的版本冒充
+    let status = channels
+        .iter()
+        .find(|s| s.channel == channel && s.state == ChannelState::Published)?;
+    update_notice(
+        channel,
+        status.version.as_deref(),
+        local,
+        applicable,
+        settings.confirm_before_install,
+    )
 }
 
 #[cfg(test)]
@@ -984,6 +1058,237 @@ mod tests {
         ) -> crate::error::CmdResult<()> {
             self.inner.download(release, dest, cancel, progress).await
         }
+    }
+
+    // ---- T-V4：自动安装通道单通道约束与 update:available 判定 ----
+
+    fn settings_with(channel: Option<&str>, confirm: bool) -> AutoChannelSettings {
+        AutoChannelSettings {
+            auto_channel: channel.map(str::to_string),
+            auto_install: channel.is_some(),
+            confirm_before_install: confirm,
+        }
+    }
+
+    #[test]
+    fn enabling_a_second_channel_turns_the_first_one_off() {
+        let next = apply_auto_channel(&settings_with(Some("latest"), true), "next", true);
+        assert_eq!(
+            next.auto_channel.as_deref(),
+            Some("next"),
+            "同一时间只允许一个通道（FR-1.4）"
+        );
+        assert!(next.auto_install, "开启后必须处于自动安装态");
+        assert_eq!(
+            settings_with(Some("latest"), true).auto_channel.as_deref(),
+            Some("latest")
+        );
+    }
+
+    #[test]
+    fn disabling_clears_both_the_channel_and_the_auto_install_flag() {
+        let next = apply_auto_channel(&settings_with(Some("next"), true), "next", false);
+        assert!(next.auto_channel.is_none());
+        assert!(!next.auto_install);
+    }
+
+    #[test]
+    fn enabling_an_unknown_channel_is_rejected() {
+        let before = settings_with(Some("latest"), true);
+        let next = apply_auto_channel(&before, "beta", true);
+        assert_eq!(
+            next.auto_channel.as_deref(),
+            Some("latest"),
+            "未知通道不得改动设置"
+        );
+    }
+
+    #[test]
+    fn switch_needs_confirm_only_when_switching_an_enabled_channel() {
+        let on_latest = settings_with(Some("latest"), true);
+        assert!(
+            switch_needs_confirm(&on_latest, "next"),
+            "切换到另一个通道需要确认"
+        );
+        assert!(
+            !switch_needs_confirm(&on_latest, "latest"),
+            "重复选择同一通道不需要确认"
+        );
+        assert!(
+            !switch_needs_confirm(&AutoChannelSettings::default(), "next"),
+            "尚未开启自动安装时不需要确认"
+        );
+    }
+
+    fn status(channel: &str, state: ChannelState, version: Option<&str>) -> ChannelStatus {
+        ChannelStatus {
+            channel: channel.to_string(),
+            state,
+            version: version.map(str::to_string),
+            published_at_iso: None,
+            tarball_url: None,
+            last_success_at_ms: None,
+            last_error: None,
+        }
+    }
+
+    #[test]
+    fn notice_requires_a_strictly_newer_remote_version() {
+        let local = semver::Version::parse("0.2.0-rc.2").unwrap();
+        // 远程更高 → 推送
+        let n = update_notice("alpha", Some("0.2.1-alpha.4"), Some(&local), true, true).unwrap();
+        assert_eq!(n.channel, "alpha");
+        assert_eq!(n.version, "0.2.1-alpha.4");
+        // 远程相同 → 不推送
+        assert!(update_notice("latest", Some("0.2.0-rc.2"), Some(&local), true, true).is_none());
+        // 远程更低 → 不推送
+        assert!(update_notice("latest", Some("0.1.0-rc.8"), Some(&local), true, true).is_none());
+        // 未发布 / 本机版本未知 / 不适用 → 不推送
+        assert!(update_notice("latest", None, Some(&local), true, true).is_none());
+        assert!(update_notice("latest", Some("0.2.1-alpha.4"), None, true, true).is_none());
+        assert!(
+            update_notice("latest", Some("0.2.1-alpha.4"), Some(&local), false, true).is_none()
+        );
+    }
+
+    #[test]
+    fn needs_confirm_follows_confirm_before_install() {
+        let local = semver::Version::parse("0.2.0-rc.2").unwrap();
+        let on = update_notice("alpha", Some("0.2.1-alpha.4"), Some(&local), true, true).unwrap();
+        assert!(on.needs_confirm, "默认仍需用户确认一次（FR-1.4）");
+        let off = update_notice("alpha", Some("0.2.1-alpha.4"), Some(&local), true, false).unwrap();
+        assert!(!off.needs_confirm, "用户关闭确认后 needsConfirm=false");
+    }
+
+    #[test]
+    fn update_available_payload_uses_the_frozen_camel_case_shape() {
+        // §3.5 冻结载荷 { channel, version, needsConfirm }：事件直接序列化 UpdateNotice
+        let local = v("0.2.0-rc.2");
+        let notice = update_notice("alpha", Some("0.2.1-alpha.4"), Some(&local), true, false)
+            .expect("远端更高时必须产出提示");
+        assert_eq!(
+            serde_json::to_value(&notice).unwrap(),
+            serde_json::json!({
+                "channel": "alpha",
+                "version": "0.2.1-alpha.4",
+                "needsConfirm": false
+            })
+        );
+    }
+
+    #[test]
+    fn auto_install_notice_requires_enabled_channel_match_and_publication() {
+        let local = v("0.2.0-rc.2");
+        let on = settings_with(Some("alpha"), true);
+        let published = vec![status(
+            "alpha",
+            ChannelState::Published,
+            Some("0.2.1-alpha.4"),
+        )];
+
+        let notice = auto_install_notice(&on, Some(&local), true, &published)
+            .expect("开启自动安装且远端严格更高时必须推送");
+        assert_eq!(notice.channel, "alpha");
+        assert_eq!(notice.version, "0.2.1-alpha.4");
+        assert!(notice.needs_confirm);
+
+        // 自动安装未开启 → 不推送（事件只服务于自动安装）
+        let mut disabled = on.clone();
+        disabled.auto_install = false;
+        assert!(auto_install_notice(&disabled, Some(&local), true, &published).is_none());
+
+        // 未选择通道 → 不推送
+        let mut no_channel = on.clone();
+        no_channel.auto_channel = None;
+        assert!(auto_install_notice(&no_channel, Some(&local), true, &published).is_none());
+
+        // 报告里没有所选通道 → 不推送（不得拿其它通道的版本冒充）
+        let other = vec![status(
+            "latest",
+            ChannelState::Published,
+            Some("0.2.1-alpha.4"),
+        )];
+        assert!(auto_install_notice(&on, Some(&local), true, &other).is_none());
+
+        // 未发布 / 失败 → 不推送
+        let unpublished = vec![status("alpha", ChannelState::Unpublished, None)];
+        assert!(auto_install_notice(&on, Some(&local), true, &unpublished).is_none());
+        let failed = vec![status("alpha", ChannelState::Failed, Some("0.2.1-alpha.4"))];
+        assert!(auto_install_notice(&on, Some(&local), true, &failed).is_none());
+
+        // 远端相同 / 更低 → 不推送
+        let same = vec![status("alpha", ChannelState::Published, Some("0.2.0-rc.2"))];
+        assert!(auto_install_notice(&on, Some(&local), true, &same).is_none());
+        let lower = vec![status("alpha", ChannelState::Published, Some("0.1.0-rc.8"))];
+        assert!(auto_install_notice(&on, Some(&local), true, &lower).is_none());
+
+        // 来源不适用 / 本机版本未知 → 不推送
+        assert!(auto_install_notice(&on, Some(&local), false, &published).is_none());
+        assert!(auto_install_notice(&on, None, true, &published).is_none());
+
+        // confirmBeforeInstall=false → needsConfirm=false
+        let mut no_confirm = on.clone();
+        no_confirm.confirm_before_install = false;
+        let notice = auto_install_notice(&no_confirm, Some(&local), true, &published)
+            .expect("关闭确认不影响推送");
+        assert!(!notice.needs_confirm, "用户关闭确认后 needsConfirm=false");
+    }
+
+    #[test]
+    fn default_settings_have_no_auto_channel() {
+        let d = AutoChannelSettings::default();
+        assert!(d.auto_channel.is_none(), "默认 autoChannel=null（§3.7）");
+        assert!(!d.auto_install, "默认 autoInstall=false（§3.7）");
+        assert!(
+            d.confirm_before_install,
+            "默认 confirmBeforeInstall=true（§3.7）"
+        );
+    }
+
+    #[test]
+    fn auto_channel_selection_survives_a_settings_round_trip_on_disk() {
+        // FR-1.4「选择结果在应用重启后保持」：必须经 SettingsStore 落盘，
+        // 所以这里真的写文件、真的从磁盘读回来（审计阻断-10）。
+        use crate::m0::paths::DataPaths;
+        use crate::m0::settings::SettingsStore;
+
+        let root = std::env::temp_dir().join("dsh-manager-vc-persist");
+        let _ = std::fs::remove_dir_all(&root);
+        let paths = DataPaths::under_root(&root);
+        paths.ensure_dirs().unwrap();
+
+        let store = SettingsStore::load_or_init(paths.settings_file()).unwrap();
+        // 先开 latest，再开 next：单通道约束应当自动关掉 latest
+        let first = apply_auto_channel(&AutoChannelSettings::default(), "latest", true);
+        store
+            .apply_patch(&serde_json::json!({
+                "autoChannel": first.auto_channel,
+                "autoInstall": first.auto_install,
+            }))
+            .unwrap();
+        let second = apply_auto_channel(&first, "next", true);
+        store
+            .apply_patch(&serde_json::json!({
+                "autoChannel": second.auto_channel,
+                "autoInstall": second.auto_install,
+            }))
+            .unwrap();
+
+        // 模拟「重启」：丢掉 store，从同一个文件重新读
+        drop(store);
+        let reopened = SettingsStore::load_or_init(paths.settings_file()).unwrap();
+        let settings = reopened.snapshot();
+        assert_eq!(
+            settings.auto_channel.as_deref(),
+            Some("next"),
+            "重启后仍是 next"
+        );
+        assert!(settings.auto_install, "自动安装开关必须一并持久化");
+        assert_ne!(
+            settings.auto_channel.as_deref(),
+            Some("latest"),
+            "A 通道必须已关闭"
+        );
     }
 
     /// 记录进入/离开顺序的替身，用来证明探测是并发的。

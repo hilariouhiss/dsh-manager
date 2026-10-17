@@ -106,3 +106,40 @@ export interface OplogPage {
 export interface ExportResult {
   bytesWritten: number;
 }
+
+/** 通道三态（主计划 §3.6，对应 Rust 的 m1::version_check::ChannelState）。 */
+export type ChannelState = "published" | "unpublished" | "failed";
+
+/** 一条通道的对外状态（主计划 §3.6，对应 Rust 的 ChannelStatus）。 */
+export interface ChannelStatus {
+  channel: string;
+  state: ChannelState;
+  version: string | null;
+  publishedAtIso: string | null;
+  tarballUrl: string | null;
+  lastSuccessAtMs: number | null;
+  lastError: AppError | null;
+}
+
+/**
+ * 版本对比结论（主计划 §3.4 命令 1）。由后端算好，前端只做文案映射，
+ * 不得自己写一份 semver 比较（审计重要-8）。
+ */
+export type VersionVerdict = "newer" | "up_to_date" | "not_applicable";
+
+/** check_updates 的出参（主计划 §3.4 命令 1，对应 Rust 的 CheckUpdatesReport）。 */
+export interface CheckUpdatesReport {
+  channels: ChannelStatus[];
+  localVersion: string | null;
+  versionApplicable: boolean;
+  notApplicableReason: string | null;
+  lastSuccessAtMs: number | null;
+  verdicts: Record<string, VersionVerdict>;
+}
+
+/** §3.5 事件 update:available 的载荷（对应 Rust 的 UpdateNotice）。 */
+export interface UpdateAvailablePayload {
+  channel: string;
+  version: string;
+  needsConfirm: boolean;
+}

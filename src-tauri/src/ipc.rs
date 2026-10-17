@@ -6,14 +6,15 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter, State};
 
 use crate::AppState;
-use crate::error::CmdResult;
+use crate::error::{AppError, CmdResult};
 use crate::m0::diagnostics::{self, DiagnosticsInput};
 use crate::m0::logging;
 use crate::m0::oplog::{OplogEntry, OplogPage};
 use crate::m0::settings::{self, Settings};
-use crate::m1::channels::ChannelsCache;
+use crate::m1::channels::{ChannelsCache, by_id};
 use crate::m1::version_check::{
-    CheckUpdatesReport, SharedOriginFacts, check_updates as run_check_updates,
+    AutoChannelSettings, CheckUpdatesReport, SharedOriginFacts, apply_auto_channel,
+    auto_install_notice, check_updates as run_check_updates,
 };
 
 /// 事件名常量（主计划 §3.5）。前端由 src/ipc/types.ts 的 EVENTS 镜像同名同值。
@@ -95,11 +96,50 @@ pub fn export_diagnostics(
     Ok(ExportResult { bytes_written })
 }
 
+/// §3.4 命令 2：设置自动安装通道，返回生效后的完整设置。
+///
+/// 前端**必须**在调用本命令之前完成切换确认（FR-1.4）；命令本身不再弹确认。
+/// 写入路径：`apply_auto_channel` 算出实际要写的两个字段（单通道约束在这里生效），
+/// 再交给 `SettingsStore::apply_patch` 校验 + 立即落盘（§3.3.2 禁止自建落盘）。
+#[tauri::command]
+pub fn set_auto_channel(
+    channel: Option<String>,
+    enabled: bool,
+    state: State<'_, AppState>,
+) -> CmdResult<Settings> {
+    let snapshot = state.settings.snapshot();
+    let current = AutoChannelSettings {
+        auto_channel: snapshot.auto_channel.clone(),
+        auto_install: snapshot.auto_install,
+        confirm_before_install: snapshot.confirm_before_install,
+    };
+    let channel = channel.unwrap_or_default();
+    if enabled && by_id(&channel).is_none() {
+        return Err(AppError::new(
+            crate::error::REGISTRY_PARSE,
+            format!("未定义的通道：{channel}。"),
+            "请从界面提供的通道列表中选择。",
+        )
+        .retryable(false));
+    }
+    let next = apply_auto_channel(&current, &channel, enabled);
+    // 只写这两个字段：autoChannel 与 autoInstall 必须**同时**落下，
+    // 否则重启后会出现「开关开着但没有通道」或反之（FR-1.4 的单通道约束）。
+    let patch = serde_json::json!({
+        "autoChannel": next.auto_channel,
+        "autoInstall": next.auto_install,
+    });
+    let (applied, _problems) = state.settings.apply_patch(&patch)?;
+    Ok(applied)
+}
+
 /// §3.4 命令 1：检查更新。入参 `{ channels: string[] }`（主计划 §3.4 冻结）。
 ///
 /// 本机版本与来源结论都从 T-O2 写入的共享状态里取；M1 不自己探测包管理器，也不探测来源。
+/// 检查完成后按 §3.5 的 update:available 判定决定是否推送自动安装提示。
 #[tauri::command]
 pub async fn check_updates(
+    app: AppHandle,
     channels: Vec<String>,
     state: State<'_, AppState>,
     facts: State<'_, SharedOriginFacts>,
@@ -114,7 +154,7 @@ pub async fn check_updates(
         .read()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .clone();
-    run_check_updates(
+    let report = run_check_updates(
         state.registry.as_ref(),
         &facts,
         &channels,
@@ -122,7 +162,26 @@ pub async fn check_updates(
         &cache_file,
         std::time::Duration::from_secs(8),
     )
-    .await
+    .await?;
+
+    // 自动安装提示：只对「已开启自动安装且所选通道严格高于本机版本」推送（FR-1.4）。
+    let settings = state.settings.snapshot();
+    let auto_settings = AutoChannelSettings {
+        auto_channel: settings.auto_channel,
+        auto_install: settings.auto_install,
+        confirm_before_install: settings.confirm_before_install,
+    };
+    // 推送失败不能把检查结果降级为失败：界面仍可直接展示检查结果
+    if let Some(notice) = auto_install_notice(
+        &auto_settings,
+        facts.local_version.as_ref(),
+        facts.version_applicable(),
+        &report.channels,
+    ) && let Err(e) = app.emit(EVENT_UPDATE_AVAILABLE, notice)
+    {
+        log::warn!("推送 update:available 失败：{e}");
+    }
+    Ok(report)
 }
 
 #[cfg(test)]

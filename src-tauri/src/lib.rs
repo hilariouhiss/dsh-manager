@@ -48,7 +48,8 @@ pub fn run() {
             ipc::update_settings,
             ipc::list_oplog,
             ipc::export_diagnostics,
-            ipc::check_updates
+            ipc::check_updates,
+            ipc::set_auto_channel
         ])
         .setup(|app| {
             let paths = DataPaths::resolve(app.handle())
