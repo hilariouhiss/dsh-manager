@@ -570,7 +570,15 @@ mod tests {
     use super::fake_registry;
 
     fn tmp_dir(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("dsh-manager-installer-test-{name}"));
+        // 每个用例一个独立目录：多个用例会经 request_for 并发调用本函数，
+        // 固定目录名会在 remove/create 之间互相踩（实测偶发 AlreadyExists）。
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "dsh-manager-installer-test-{name}-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir

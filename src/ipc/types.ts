@@ -168,3 +168,33 @@ export interface InstanceInfo {
   url: string | null;
   state: InstanceState;
 }
+
+/** 包管理器种类（对应 Rust 的 ports::package_manager::PmKind）。 */
+export type PmKind = "npm" | "pnpm" | "bun";
+
+/**
+ * 安装来源结论（对应 Rust 的 m1::version_check::OriginVerdict）。
+ *
+ * 序列化用外部标签：带载荷的变体是单键对象（`{ packageManager: "npm" }`），
+ * 其余变体是字符串。M2 复用 M1 的枚举，前端镜像不得改成 `{ kind, pmKind }` 形状。
+ */
+export type OriginVerdict =
+  | { packageManager: PmKind }
+  | "officialInstaller"
+  | "portable"
+  | "unidentified";
+
+/** 一条判定依据（对应 Rust 的 m2::origin_detect::Evidence）。 */
+export interface Evidence {
+  source: string;
+  path: string;
+  observed: string;
+  supports: boolean;
+}
+
+/** detect_origin 的出参（主计划 §3.4 命令 5，对应 Rust 的 OriginReport）。 */
+export interface OriginReport {
+  verdict: OriginVerdict;
+  evidences: Evidence[];
+  missing: string[];
+}

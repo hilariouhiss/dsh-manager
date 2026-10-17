@@ -3,6 +3,7 @@ pub mod error;
 pub mod ipc;
 pub mod m0;
 pub mod m1;
+pub mod m2;
 pub mod m3;
 pub mod ports;
 
@@ -20,6 +21,7 @@ use crate::m0::oplog::Oplog;
 use crate::m0::paths::DataPaths;
 use crate::m0::settings::{self, SettingsStore};
 use crate::m1::version_check::{OriginFacts, SharedOriginFacts};
+use crate::m2::origin_detect::{self, OriginPaths, OriginReport, PER_SOURCE_TIMEOUT};
 use crate::m3::instance_discovery::{InstanceInfo, InstanceLister, ProcessLister};
 use crate::ports::package_manager::PackageManager;
 use crate::ports::process::ProcessProbe;
@@ -50,6 +52,28 @@ fn list_instances(state: tauri::State<'_, AppState>) -> CmdResult<Vec<InstanceIn
     state.lister.list_web_instances()
 }
 
+/// §3.4 命令 5：识别本机 DSH 的安装来源，返回四值结论与依据清单。
+///
+/// 同一次探测同时写回 `SharedOriginFacts`：版本页不必先访问「安装来源」页，
+/// 也能拿到本机版本与来源结论（裁定 3）。`Unidentified` 是正常返回值，不是错误。
+#[tauri::command]
+async fn detect_origin(
+    state: tauri::State<'_, AppState>,
+    facts: tauri::State<'_, SharedOriginFacts>,
+) -> CmdResult<OriginReport> {
+    let pm = state.package_manager.clone();
+    let (report, fresh) = origin_detect::detect_and_gather(
+        pm.as_ref(),
+        &OriginPaths::for_this_machine(),
+        PER_SOURCE_TIMEOUT,
+    )
+    .await;
+    *facts
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = fresh;
+    Ok(report)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -69,7 +93,8 @@ pub fn run() {
             ipc::set_auto_channel,
             ipc::start_install,
             ipc::cancel_task,
-            list_instances
+            list_instances,
+            detect_origin
         ])
         .setup(|app| {
             let paths = DataPaths::resolve(app.handle())

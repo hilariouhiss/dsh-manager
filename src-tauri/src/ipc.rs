@@ -1,6 +1,7 @@
 //! 命令与事件的汇聚点（冻结契约见主计划 §3.4、§3.5）。
 
 use std::path::Path;
+use std::time::Duration;
 
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, State};
@@ -19,9 +20,10 @@ use crate::m1::installer::{
     download_and_verify,
 };
 use crate::m1::version_check::{
-    AutoChannelSettings, CheckUpdatesReport, SharedOriginFacts, apply_auto_channel,
+    AutoChannelSettings, CheckUpdatesReport, OriginFacts, SharedOriginFacts, apply_auto_channel,
     auto_install_notice, check_updates as run_check_updates,
 };
+use crate::m2::origin_detect::{self, OriginPaths, PER_SOURCE_TIMEOUT};
 use crate::m3::instance_discovery::InstanceLister;
 use crate::ports::package_manager::{PackageManager, PmInfo};
 use crate::ports::registry::ChannelProbe;
@@ -167,9 +169,27 @@ pub fn set_auto_channel(
     Ok(applied)
 }
 
+/// 来源事实的刷新入口（裁定 3）：每次检查更新前重新取证，写回共享状态并返回本次事实。
+///
+/// 安装会改变本机已装版本；不能依赖上次 `/origin` 页的结论，否则自动安装成功后
+/// 本机版本仍是旧值（安装成功回路失效），首次打开版本页也拿不到结论。
+async fn refresh_origin_facts(
+    pm: &dyn PackageManager,
+    paths: &OriginPaths,
+    per_source: Duration,
+    shared: &SharedOriginFacts,
+) -> OriginFacts {
+    let fresh = origin_detect::gather(pm, paths, per_source).await;
+    *shared
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = fresh.clone();
+    fresh
+}
+
 /// §3.4 命令 1：检查更新。入参 `{ channels: string[] }`（主计划 §3.4 冻结）。
 ///
-/// 本机版本与来源结论都从 T-O2 写入的共享状态里取；M1 不自己探测包管理器，也不探测来源。
+/// 本机版本与来源结论都在本命令里经 `refresh_origin_facts` 重新取证后交给 M1；
+/// M1 不自己探测包管理器，也不探测来源（§2.3 依赖方向）。
 /// 检查完成后按 §3.5 的 update:available 判定决定是否推送自动安装提示。
 #[tauri::command]
 pub async fn check_updates(
@@ -183,14 +203,17 @@ pub async fn check_updates(
     if let Some(problem) = cache_error {
         log::warn!("{problem}");
     }
-    // 读锁只持有到克隆完成，不跨 await；中毒时取回内部值，不让一次旧 panic 卡住检查。
-    let facts = facts
-        .read()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .clone();
+    // 每次检查都重新取证：安装后本机版本变化，且用户可能从未打开过「安装来源」页。
+    let origin_facts = refresh_origin_facts(
+        state.package_manager.as_ref(),
+        &OriginPaths::for_this_machine(),
+        PER_SOURCE_TIMEOUT,
+        facts.inner(),
+    )
+    .await;
     let report = run_check_updates(
         state.registry.as_ref(),
-        &facts,
+        &origin_facts,
         &channels,
         &previous,
         &cache_file,
@@ -208,8 +231,8 @@ pub async fn check_updates(
     // 推送失败不能把检查结果降级为失败：界面仍可直接展示检查结果
     if let Some(notice) = auto_install_notice(
         &auto_settings,
-        facts.local_version.as_ref(),
-        facts.version_applicable(),
+        origin_facts.local_version.as_ref(),
+        origin_facts.version_applicable(),
         &report.channels,
     ) && let Err(e) = app.emit(EVENT_UPDATE_AVAILABLE, notice)
     {
@@ -776,5 +799,55 @@ mod tests {
 
         let page = oplog.read_page(0, 10).unwrap();
         assert_eq!(page.total, 2, "每次通道切换记一条");
+    }
+
+    /// 裁定 3：check_updates 每次调用前都要重新取证并写回共享事实。
+    /// 覆盖「安装成功后本机版本变化」与「用户从未打开过 /origin」两种场景。
+    #[tokio::test]
+    async fn check_updates_refreshes_origin_facts_before_reading_them() {
+        use crate::adapters::fake::fake_pm::{FakePm, fake_pm_info};
+        use crate::m1::version_check::{OriginFacts, OriginVerdict};
+
+        let root = temp_root("ipc-origin-refresh");
+        let global = root.join("npm").join("node_modules");
+        let pkg = global.join(crate::ports::package_manager::DSH_PACKAGE_NAME);
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::write(pkg.join("package.json"), r#"{"version":"0.2.1-alpha.4"}"#).unwrap();
+
+        let pm = FakePm::new(vec![fake_pm_info(PmKind::Npm, global)]).with_installed(
+            PmKind::Npm,
+            Some(semver::Version::parse("0.2.1-alpha.4").unwrap()),
+        );
+        // 启动时的默认值：来源识别尚未落地。刷新后必须被真实结论替换。
+        let shared: SharedOriginFacts = std::sync::Arc::new(std::sync::RwLock::new(
+            OriginFacts::unidentified("来源识别尚未落地", None),
+        ));
+        let paths = OriginPaths {
+            installer_roots: Vec::new(),
+            path_dirs: Vec::new(),
+        };
+
+        let fresh =
+            refresh_origin_facts(&pm, &paths, std::time::Duration::from_millis(200), &shared).await;
+
+        assert_eq!(
+            fresh.verdict,
+            OriginVerdict::PackageManager(PmKind::Npm),
+            "刷新必须得到真实结论"
+        );
+        assert!(fresh.version_applicable(), "包管理器安装必须让版本对比适用");
+        assert_eq!(
+            fresh.local_version,
+            Some(semver::Version::parse("0.2.1-alpha.4").unwrap()),
+            "本机版本必须随刷新更新"
+        );
+        let stored = shared.read().unwrap_or_else(|p| p.into_inner()).clone();
+        assert_eq!(stored.verdict, fresh.verdict, "共享状态要被写回");
+        assert_eq!(stored.local_version, fresh.local_version);
+        assert!(
+            pm.write_calls().is_empty(),
+            "刷新来源事实不得写任何东西：{:?}",
+            pm.write_calls()
+        );
     }
 }
