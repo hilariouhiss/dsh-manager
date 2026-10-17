@@ -168,6 +168,81 @@ pub fn build_start_spec(
     }
 }
 
+/// taskkill 的唯一出口。**它不是端口**：进程终止是 M3 的实现细节（§3.3 契约约束）。
+///
+/// 测试用 `TaskKill::recording()` 替换真实调用，从而断言「拒绝路径没有发出任何终止命令」。
+pub struct TaskKill {
+    mode: KillMode,
+}
+
+enum KillMode {
+    Real,
+    Record(Arc<Mutex<Vec<(u32, bool)>>>),
+}
+
+/// 系统 taskkill 的绝对路径；取不到 SystemRoot 时退回裸命令名让 CreateProcess 走 PATH。
+pub fn taskkill_program() -> PathBuf {
+    std::env::var_os("SystemRoot")
+        .map(|root| PathBuf::from(root).join("System32").join("taskkill.exe"))
+        .unwrap_or_else(|| PathBuf::from("taskkill.exe"))
+}
+
+impl TaskKill {
+    pub fn real() -> Self {
+        Self {
+            mode: KillMode::Real,
+        }
+    }
+
+    /// 只记录、不真的终止进程。
+    pub fn recording() -> Self {
+        Self {
+            mode: KillMode::Record(Arc::new(Mutex::new(Vec::new()))),
+        }
+    }
+
+    /// 已发出的终止调用，按时间顺序的 `(pid, force)`。真实实现返回空表。
+    pub fn calls(&self) -> Vec<(u32, bool)> {
+        match &self.mode {
+            KillMode::Record(v) => v.lock().expect("记录锁被毒化").clone(),
+            KillMode::Real => Vec::new(),
+        }
+    }
+
+    /// 终止整个进程树。`force == false` 时是 `taskkill /PID <pid> /T`（**不带 /F**）。
+    ///
+    /// 返回的是 taskkill 的退出码：非零（例如进程已不存在）**不作为错误**，最终结论由停止后的复核给出。
+    pub async fn kill_tree(&self, pid: u32, force: bool) -> CmdResult<i32> {
+        if let KillMode::Record(v) = &self.mode {
+            v.lock().expect("记录锁被毒化").push((pid, force));
+            return Ok(0);
+        }
+
+        let mut args = vec!["/PID".to_string(), pid.to_string(), "/T".to_string()];
+        if force {
+            args.push("/F".to_string());
+        }
+
+        let mut cmd = Command::new(taskkill_program());
+        cmd.args(&args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        cmd.creation_flags(CREATE_NO_WINDOW);
+
+        let out = cmd.output().await.map_err(|e| {
+            AppError::new(
+                crate::error::INSTANCE_STOP_TIMEOUT,
+                format!("无法执行 taskkill 终止进程 {pid}"),
+                "先在本机命令行执行 taskkill /? 确认该命令可用，然后重试。",
+            )
+            .with_raw(e.to_string())
+            .retryable(true)
+        })?;
+        Ok(out.status.code().unwrap_or(-1))
+    }
+}
+
 /// 一个实例的运行期记录。登记表只放**本工具启动的**实例。
 pub struct InstanceEntry {
     pub instance_id: String,
@@ -1017,8 +1092,11 @@ mod tests {
         );
     }
 
-    use crate::error::{INSTANCE_ALREADY_RUNNING, INSTANCE_NOT_MANAGED};
-    use crate::ports::process::ProcInfo;
+    use crate::error::{
+        INSTANCE_ALREADY_RUNNING, INSTANCE_FORCED_STOP_REQUIRED, INSTANCE_NOT_MANAGED,
+        INSTANCE_STOP_TIMEOUT,
+    };
+    use crate::ports::process::{ProcInfo, ProcessProbe};
 
     fn web_proc(pid: u32) -> ProcInfo {
         ProcInfo {
@@ -1121,6 +1199,306 @@ mod tests {
             err.next_step
         );
     }
+
+    #[tokio::test]
+    async fn taskkill_records_the_gentle_then_forced_order() {
+        let kill = TaskKill::recording();
+        assert!(kill.calls().is_empty());
+        kill.kill_tree(1234, false).await.unwrap();
+        kill.kill_tree(1234, true).await.unwrap();
+        assert_eq!(
+            kill.calls(),
+            vec![(1234, false), (1234, true)],
+            "强制与否必须能被记录，供断言使用"
+        );
+    }
+
+    #[test]
+    fn taskkill_program_is_the_system_one() {
+        let program = taskkill_program();
+        assert!(
+            program
+                .to_string_lossy()
+                .to_ascii_lowercase()
+                .ends_with("taskkill.exe")
+        );
+    }
+
+    fn child_proc(pid: u32, parent: u32) -> ProcInfo {
+        ProcInfo {
+            pid,
+            parent_pid: Some(parent),
+            cmdline: vec!["node".to_string(), "worker.js".to_string()],
+            started_at_epoch_secs: Some(1_700_000_000),
+            exe: None,
+        }
+    }
+
+    /// 造一条 running 的登记项并登记到 runner（字段齐全，复用既有 test_entry，见 brief 偏差）。
+    fn registered(runner: &InstanceRunner, pid: u32, id: &str) -> Arc<InstanceEntry> {
+        let entry = test_entry(runner.managed_registry(), id, pid, Path::new(r"."));
+        runner.insert(entry.clone());
+        entry
+    }
+
+    fn stop_req(id: &str, force: bool, confirm_external: bool) -> StopRequest {
+        StopRequest {
+            instance_id: id.to_string(),
+            force,
+            confirm_external,
+        }
+    }
+
+    const SHORT: std::time::Duration = std::time::Duration::from_millis(150);
+
+    /// §3.9 D-3 第二档：外部实例没有更强确认时，**一次终止命令都不许发**。
+    #[tokio::test]
+    async fn external_instance_without_confirmation_is_refused_without_any_kill() {
+        let (runner, _emitter) = recording_runner();
+        let probe = FakeProbe::new(vec![web_proc(4242)]);
+        let kill = TaskKill::recording();
+
+        let err = stop(
+            &runner,
+            &probe,
+            &kill,
+            stop_req("pid-4242", false, false),
+            SHORT,
+            SHORT,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.code, INSTANCE_NOT_MANAGED);
+        assert!(
+            err.reason.contains("4242"),
+            "文案要指明影响哪个实例：{}",
+            err.reason
+        );
+        assert!(
+            kill.calls().is_empty(),
+            "未确认的外部实例绝不允许发出终止命令：{:?}",
+            kill.calls()
+        );
+        assert!(probe.snapshot_calls() >= 1, "拒绝前必须已经枚举确认过目标");
+        assert!(probe.is_alive(4242), "拒绝路径不得影响外部实例");
+    }
+
+    /// 第二档：外部实例确认后，也只用**不带 /F** 的进程树终止。
+    #[tokio::test]
+    async fn external_instance_with_confirmation_uses_the_gentle_kill() {
+        let (runner, _emitter) = recording_runner();
+        let probe = FakeProbe::new(vec![web_proc(4242)]).with_alive(Vec::new());
+        let kill = TaskKill::recording();
+
+        let result = stop(
+            &runner,
+            &probe,
+            &kill,
+            stop_req("pid-4242", false, true),
+            SHORT,
+            SHORT,
+        )
+        .await
+        .unwrap();
+
+        assert!(result.stopped);
+        assert!(result.residual_pids.is_empty());
+        assert!(!result.forced);
+        assert_eq!(
+            kill.calls(),
+            vec![(4242, false)],
+            "确认外部实例后第一次也必须不带 /F"
+        );
+        assert!(probe.snapshot_calls() >= 1, "停止后必须再次枚举复核");
+    }
+
+    /// 第一档：本工具实例正常停止，第一次不带 /F，停止后复核为空。
+    #[tokio::test]
+    async fn managed_stop_leaves_no_residual() {
+        let (runner, emitter) = recording_runner();
+        let entry = registered(&runner, 5000, "inst-s1");
+        let probe = FakeProbe::new(Vec::new()).with_alive(Vec::new());
+        let kill = TaskKill::recording();
+
+        let result = stop(
+            &runner,
+            &probe,
+            &kill,
+            stop_req("inst-s1", false, false),
+            SHORT,
+            SHORT,
+        )
+        .await
+        .unwrap();
+
+        assert!(result.stopped);
+        assert!(result.residual_pids.is_empty(), "E2E-7 要求无残留");
+        assert!(!result.forced);
+        assert_eq!(
+            kill.calls(),
+            vec![(5000, false)],
+            "先礼后兵：第一次必须不带 /F"
+        );
+        assert!(probe.snapshot_calls() >= 1, "停止后必须再次枚举复核");
+        assert_eq!(
+            entry.state(),
+            InstanceState::Stopped,
+            "停止后界面状态与实际一致（FR-4.3）"
+        );
+        assert!(
+            runner.managed_pids().is_empty(),
+            "停止后受管登记必须清除：{:?}",
+            runner.managed_pids()
+        );
+        assert!(
+            emitter
+                .states()
+                .iter()
+                .any(|s| s.instance_id == "inst-s1" && s.state == InstanceState::Stopped),
+            "停止后必须推送 instance:state stopped：{:?}",
+            emitter.states()
+        );
+    }
+
+    /// 第三档：超时不得自动强制，必须单独确认；第二次才带 /F。
+    #[tokio::test]
+    async fn timeout_requires_a_separate_forced_confirmation() {
+        let (runner, _emitter) = recording_runner();
+        registered(&runner, 6000, "inst-s2");
+        let kill = TaskKill::recording();
+
+        let stuck = FakeProbe::new(vec![web_proc(6000)]).with_alive(vec![6000]);
+        let err = stop(
+            &runner,
+            &stuck,
+            &kill,
+            stop_req("inst-s2", false, false),
+            SHORT,
+            SHORT,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.code, INSTANCE_FORCED_STOP_REQUIRED,
+            "超时不得自动强制（FR-4.5）"
+        );
+        assert_eq!(
+            kill.calls(),
+            vec![(6000, false)],
+            "超时后不允许自动补一次 /F"
+        );
+        assert!(
+            err.next_step.contains("强制"),
+            "下一步要引导单独确认：{}",
+            err.next_step
+        );
+        assert!(
+            err.next_step.contains("丢失"),
+            "要提示可能丢失正在进行的任务：{}",
+            err.next_step
+        );
+        assert!(!err.retryable, "强制确认不是「重试」");
+        assert!(
+            stuck.snapshot_calls() >= 1,
+            "超时路径也必须再次枚举复核（不能因为超时就跳过复核）"
+        );
+
+        let gone = FakeProbe::new(Vec::new()).with_alive(Vec::new());
+        let result = stop(
+            &runner,
+            &gone,
+            &kill,
+            stop_req("inst-s2", true, false),
+            SHORT,
+            SHORT,
+        )
+        .await
+        .unwrap();
+        assert!(result.stopped);
+        assert!(result.forced);
+        assert_eq!(
+            kill.calls(),
+            vec![(6000, false), (6000, true)],
+            "第二次才带 /F"
+        );
+    }
+
+    /// 复核有残留时如实报告，不谎报成功。
+    #[tokio::test]
+    async fn residual_children_are_reported() {
+        let (runner, _emitter) = recording_runner();
+        registered(&runner, 7000, "inst-s3");
+        let probe = FakeProbe::new(vec![child_proc(7001, 7000)]).with_alive(vec![7001]);
+        let kill = TaskKill::recording();
+
+        let result = stop(
+            &runner,
+            &probe,
+            &kill,
+            stop_req("inst-s3", true, false),
+            SHORT,
+            SHORT,
+        )
+        .await
+        .unwrap();
+
+        assert!(!result.stopped, "有残留时 stopped 必须为 false");
+        assert_eq!(
+            result.residual_pids,
+            vec![7001],
+            "残留 pid 要如实填进 residualPids"
+        );
+    }
+
+    /// 「连复核都做不了」才是 instance.stop_timeout；可观测的残留是正常返回值（§3.9 T-I4 要点 6）。
+    #[tokio::test]
+    async fn unreachable_recheck_is_reported_as_stop_timeout() {
+        let (runner, _emitter) = recording_runner();
+        registered(&runner, 8000, "inst-s4");
+        let probe = FakeProbe::new(Vec::new())
+            .with_alive(Vec::new())
+            .failing_snapshot();
+        let kill = TaskKill::recording();
+
+        let err = stop(
+            &runner,
+            &probe,
+            &kill,
+            stop_req("inst-s4", false, false),
+            SHORT,
+            SHORT,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.code, INSTANCE_STOP_TIMEOUT);
+        assert!(err.retryable, "instance.stop_timeout 是可重试错误（§3.2）");
+        assert_eq!(kill.calls(), vec![(8000, false)]);
+    }
+
+    /// 标识既不在登记表、也不在枚举结果里：如实报错，也不发终止命令。
+    #[tokio::test]
+    async fn unknown_instance_id_is_reported_without_any_kill() {
+        let (runner, _emitter) = recording_runner();
+        let probe = FakeProbe::new(Vec::new());
+        let kill = TaskKill::recording();
+
+        let err = stop(
+            &runner,
+            &probe,
+            &kill,
+            stop_req("pid-9999", false, true),
+            SHORT,
+            SHORT,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.code, INSTANCE_NOT_MANAGED);
+        assert!(kill.calls().is_empty());
+        assert!(probe.snapshot_calls() >= 1, "必须先枚举确认目标是否存在");
+    }
 }
 
 /// 命令 9 的实现：按 `fromSeq` 取输出分页。
@@ -1144,4 +1522,186 @@ pub fn list_output(
         .lock()
         .expect("输出缓冲锁被毒化")
         .page(from_seq))
+}
+
+/// 命令 8 的出参。`residualPids` 非空时 `stopped` 必为 `false`。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StopResult {
+    pub stopped: bool,
+    pub residual_pids: Vec<u32>,
+    pub forced: bool,
+}
+
+/// 停止请求。三档确认强度由 `confirm_external` 与 `force` 表达（§3.9 D-3）。
+#[derive(Debug, Clone)]
+pub struct StopRequest {
+    pub instance_id: String,
+    pub force: bool,
+    pub confirm_external: bool,
+}
+
+/// 非强制停止的等待时限（先礼后兵）。
+pub const STOP_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+/// 强制终止后的等待时限。
+pub const FORCE_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
+
+enum StopTarget {
+    Managed { pid: u32 },
+    External { pid: u32 },
+}
+
+fn resolve_target(
+    runner: &InstanceRunner,
+    probe: &dyn crate::ports::process::ProcessProbe,
+    instance_id: &str,
+) -> CmdResult<StopTarget> {
+    if let Some(entry) = runner.get(instance_id) {
+        return Ok(StopTarget::Managed { pid: entry.pid });
+    }
+
+    let pid: u32 = instance_id
+        .strip_prefix("pid-")
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| {
+            AppError::new(
+                crate::error::INSTANCE_NOT_MANAGED,
+                format!("找不到实例 {instance_id}"),
+                "回到「运行实例」页刷新列表，确认实例标识后再试。",
+            )
+        })?;
+
+    let listed = crate::m3::instance_discovery::discover(
+        probe,
+        &runner.managed_pids(),
+        crate::m3::now_ms(),
+    )?;
+    if listed.iter().any(|i| i.pid == pid && !i.managed) {
+        Ok(StopTarget::External { pid })
+    } else {
+        Err(AppError::new(
+            crate::error::INSTANCE_NOT_MANAGED,
+            format!("实例 {instance_id} 已不在运行"),
+            "回到「运行实例」页刷新列表；如果它已经被停掉，界面会自动显示「未运行」。",
+        ))
+    }
+}
+
+/// `root` 及其全部子孙里**仍存活**的 pid，升序。这就是 E2E-7 的「复核无残留」。
+fn live_tree(probe: &dyn crate::ports::process::ProcessProbe, root: u32) -> CmdResult<Vec<u32>> {
+    let snapshot = probe.snapshot()?;
+    let mut tree = vec![root];
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for p in &snapshot {
+            if let Some(parent) = p.parent_pid
+                && tree.contains(&parent)
+                && !tree.contains(&p.pid)
+            {
+                tree.push(p.pid);
+                changed = true;
+            }
+        }
+    }
+    let mut alive: Vec<u32> = tree
+        .into_iter()
+        .filter(|pid| probe.is_alive(*pid))
+        .collect();
+    alive.sort_unstable();
+    Ok(alive)
+}
+
+async fn wait_gone(
+    probe: &dyn crate::ports::process::ProcessProbe,
+    pid: u32,
+    wait: std::time::Duration,
+) -> bool {
+    let deadline = std::time::Instant::now() + wait;
+    loop {
+        if !probe.is_alive(pid) {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(POLL_INTERVAL.min(wait)).await;
+    }
+}
+
+/// 命令 8 的实现。四步顺序见任务说明，任何一步都不得省略。
+pub async fn stop(
+    runner: &InstanceRunner,
+    probe: &dyn crate::ports::process::ProcessProbe,
+    kill: &TaskKill,
+    req: StopRequest,
+    stop_wait: std::time::Duration,
+    force_wait: std::time::Duration,
+) -> CmdResult<StopResult> {
+    let target = resolve_target(runner, probe, &req.instance_id)?;
+
+    let pid = match target {
+        StopTarget::External { pid } => {
+            if !req.confirm_external {
+                return Err(AppError::new(
+                    crate::error::INSTANCE_NOT_MANAGED,
+                    format!(
+                        "实例 {} 不是由本工具启动（pid {pid}），停止它需要更强确认",
+                        req.instance_id
+                    ),
+                    "该实例可能正在执行任务。确认要停止它时，请勾选「我知道这个实例不是本工具启动的」后再试。",
+                ));
+            }
+            pid
+        }
+        StopTarget::Managed { pid } => pid,
+    };
+
+    // 先礼后兵：force == false 时**不带** /F。
+    let _ = kill.kill_tree(pid, req.force).await?;
+
+    let wait = if req.force { force_wait } else { stop_wait };
+    let gone = wait_gone(probe, pid, wait).await;
+
+    // 无论哪条路径，停止后**必须**再次枚举复核（E2E-7「无残留」）。
+    // 复核本身做不了才是 instance.stop_timeout；可观测的残留是正常返回值（§3.9 T-I4 要点 6）。
+    let residual_pids = live_tree(probe, pid).map_err(|e| {
+        AppError::new(
+            crate::error::INSTANCE_STOP_TIMEOUT,
+            format!(
+                "实例 {} 已收到停止命令，但复核进程表失败，无法确认是否还有残留",
+                req.instance_id
+            ),
+            "重新点击「停止」再试一次；若反复失败，请在「设置」页导出诊断包反馈。",
+        )
+        .with_raw(format!("{}：{}", e.code, e.reason))
+        .retryable(true)
+    })?;
+
+    if !gone && !req.force {
+        return Err(AppError::new(
+            crate::error::INSTANCE_FORCED_STOP_REQUIRED,
+            format!(
+                "实例 {} 在等待时限内没有退出（仍有 {} 个进程存活）",
+                req.instance_id,
+                residual_pids.len()
+            ),
+            "它可能正在执行任务。确认要强制终止时，请单独确认「强制终止」——该操作可能丢失正在进行的任务。",
+        ));
+    }
+
+    let stopped = residual_pids.is_empty();
+    if stopped && let Some(entry) = runner.get(&req.instance_id) {
+        entry.set_state(InstanceState::Stopped);
+        runner
+            .emitter()
+            .emit_state(state_payload(&entry, InstanceState::Stopped));
+    }
+
+    Ok(StopResult {
+        stopped,
+        residual_pids,
+        forced: req.force,
+    })
 }

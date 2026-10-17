@@ -236,3 +236,13 @@ export interface InstanceUrlPayload {
   instanceId: string;
   url: string;
 }
+
+/**
+ * stop_instance 的出参（主计划 §3.4 命令 8，对应 Rust 的 StopResult）。
+ * residualPids 非空时 stopped 必为 false：如实报告残留，不谎报成功。
+ */
+export interface StopResult {
+  stopped: boolean;
+  residualPids: number[];
+  forced: boolean;
+}

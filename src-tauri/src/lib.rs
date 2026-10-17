@@ -147,6 +147,32 @@ async fn start_instance(
     Ok(StartInstanceOutput { instance_id: id })
 }
 
+/// §3.4 命令 8：停止实例。三档确认强度见 §3.9 D-3：
+/// 外部实例必须显式确认、先礼后兵（不带 /F）、超时不自动强制、停止后必定复核。
+#[tauri::command]
+async fn stop_instance(
+    state: tauri::State<'_, AppState>,
+    instance_id: String,
+    force: bool,
+    confirm_external: bool,
+) -> CmdResult<instance_runner::StopResult> {
+    // TaskKill 无状态：装配点不需要托管它，也不需要往 AppState 里加字段。
+    let kill = instance_runner::TaskKill::real();
+    instance_runner::stop(
+        state.runner.as_ref(),
+        state.process_probe.as_ref(),
+        &kill,
+        instance_runner::StopRequest {
+            instance_id,
+            force,
+            confirm_external,
+        },
+        instance_runner::STOP_WAIT,
+        instance_runner::FORCE_WAIT,
+    )
+    .await
+}
+
 /// §3.4 命令 9：按 `fromSeq` 取输出分页。
 #[tauri::command]
 fn list_output(
@@ -207,6 +233,7 @@ pub fn run() {
             list_instances,
             detect_origin,
             start_instance,
+            stop_instance,
             list_output
         ])
         .setup(|app| {
