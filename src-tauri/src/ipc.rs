@@ -20,8 +20,8 @@ use crate::m1::installer::{
     download_and_verify,
 };
 use crate::m1::version_check::{
-    AutoChannelSettings, CheckUpdatesReport, OriginFacts, SharedOriginFacts, apply_auto_channel,
-    auto_install_notice, check_updates as run_check_updates,
+    AutoChannelSettings, CheckUpdatesReport, OriginFacts, OriginVerdict, SharedOriginFacts,
+    apply_auto_channel, auto_install_notice, check_updates as run_check_updates,
 };
 use crate::m2::origin_detect::{self, OriginPaths, PER_SOURCE_TIMEOUT};
 use crate::m3::instance_discovery::InstanceLister;
@@ -126,20 +126,39 @@ pub fn list_oplog(state: State<'_, AppState>, offset: usize, limit: usize) -> Cm
     state.oplog.read_page(offset, limit)
 }
 
+/// 诊断包里的「本机 DSH」两行（NFR-6）：本机版本与来源结论取自已由 T-O2 维护的共享事实。
+/// 只做展示映射，不探测、不猜测；版本确实不存在时才返回 None（报告写「未取得」）。
+fn diagnostics_facts(facts: &OriginFacts) -> (Option<String>, Option<String>) {
+    let local_version = facts.local_version.as_ref().map(|v| v.to_string());
+    let verdict = match facts.verdict {
+        OriginVerdict::PackageManager(kind) => format!("包管理器安装（{}）", kind.label_zh()),
+        OriginVerdict::OfficialInstaller => "官方安装器".to_string(),
+        OriginVerdict::Portable => "便携版".to_string(),
+        OriginVerdict::Unidentified => "未识别".to_string(),
+    };
+    (local_version, Some(verdict))
+}
+
 /// 命令 15：导出诊断包（不含凭据，NFR-6）。三个目录直接从 §3.3.2 冻结的 `AppState.paths` 取。
 #[tauri::command]
 pub fn export_diagnostics(
     state: State<'_, AppState>,
+    facts: State<'_, SharedOriginFacts>,
     target_path: String,
 ) -> CmdResult<ExportResult> {
     let settings = state.settings.snapshot();
     let page = state.oplog.read_page(0, diagnostics::OPLOG_TAIL)?;
+    let facts = facts
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    let (local_dsh_version, origin_verdict) = diagnostics_facts(&facts);
     let input = DiagnosticsInput {
         paths: &state.paths,
         settings: &settings,
         entries: &page.entries,
-        local_dsh_version: None,
-        origin_verdict: None,
+        local_dsh_version,
+        origin_verdict,
     };
     let bytes_written = diagnostics::export(&input, Path::new(&target_path))?;
     Ok(ExportResult { bytes_written })
@@ -886,6 +905,54 @@ mod tests {
             pm.write_calls().is_empty(),
             "刷新来源事实不得写任何东西：{:?}",
             pm.write_calls()
+        );
+    }
+
+    /// NFR-6：诊断包必须写真实的本机版本与来源结论，而不是恒为「未取得」。
+    #[test]
+    fn diagnostics_facts_map_every_verdict_and_keep_missing_version_unknown() {
+        let version = semver::Version::parse("0.2.1-alpha.4").unwrap();
+        for (kind, label) in [
+            (PmKind::Npm, "包管理器安装（npm）"),
+            (PmKind::Pnpm, "包管理器安装（pnpm）"),
+            (PmKind::Bun, "包管理器安装（bun）"),
+        ] {
+            let facts = OriginFacts::package_manager(kind, Some(&version));
+            assert_eq!(
+                diagnostics_facts(&facts),
+                (Some("0.2.1-alpha.4".to_string()), Some(label.to_string())),
+                "包管理器结论必须带出本机版本"
+            );
+        }
+
+        let installer = OriginFacts {
+            verdict: OriginVerdict::OfficialInstaller,
+            missing: Vec::new(),
+            local_version: Some(version.clone()),
+        };
+        assert_eq!(
+            diagnostics_facts(&installer),
+            (
+                Some("0.2.1-alpha.4".to_string()),
+                Some("官方安装器".to_string())
+            )
+        );
+
+        let portable = OriginFacts {
+            verdict: OriginVerdict::Portable,
+            missing: Vec::new(),
+            local_version: None,
+        };
+        assert_eq!(
+            diagnostics_facts(&portable),
+            (None, Some("便携版".to_string())),
+            "真正拿不到版本时才允许写「未取得」"
+        );
+
+        let unidentified = OriginFacts::unidentified("来源识别尚未落地", None);
+        assert_eq!(
+            diagnostics_facts(&unidentified),
+            (None, Some("未识别".to_string()))
         );
     }
 }
