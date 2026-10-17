@@ -255,10 +255,99 @@ where
     None
 }
 
+/// PATH 扫描结果：启动器本身 + 其同级、含本包的 node_modules。
+#[derive(Debug, Default)]
+struct LauncherScan {
+    launcher: Option<PathBuf>,
+    node_modules: Option<PathBuf>,
+}
+
+/// 只允许在阻塞线程里调用：解析 PATH 启动器并检查其同级的包目录。**零写操作。**
+fn scan_launcher(dirs: Vec<PathBuf>) -> LauncherScan {
+    let Some(launcher) = resolve_in(dirs, "dsh") else {
+        return LauncherScan::default();
+    };
+    let node_modules = launcher.parent().and_then(|dir| {
+        let node_modules = dir.join("node_modules");
+        if node_modules
+            .join(DSH_PACKAGE_NAME)
+            .join("package.json")
+            .is_file()
+        {
+            Some(node_modules)
+        } else {
+            None
+        }
+    });
+    LauncherScan {
+        launcher: Some(launcher),
+        node_modules,
+    }
+}
+
+/// 只允许在阻塞线程里调用：在安装器候选目录里找标记目录。**零写操作。**
+fn scan_installer_roots(roots: &[PathBuf]) -> (Option<PathBuf>, Vec<String>) {
+    let mut hit = None;
+    let mut misses = Vec::new();
+    for root in roots {
+        if !root.is_dir() {
+            misses.push(format!("{}（目录不存在）", root.display()));
+            continue;
+        }
+        match std::fs::read_dir(root) {
+            Ok(entries) => {
+                for entry in entries.flatten() {
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    if INSTALLER_MARKERS
+                        .iter()
+                        .any(|m| m.eq_ignore_ascii_case(&name))
+                    {
+                        hit = Some(entry.path());
+                    }
+                }
+            }
+            Err(e) => misses.push(format!("{}（无法读取：{e}）", root.display())),
+        }
+    }
+    (hit, misses)
+}
+
+/// 在阻塞线程里跑一次只读文件系统扫描，并套用与端口调用相同的单项预算。
+///
+/// 失联的映射网络盘上的 PATH 条目会让 stat/read_dir 卡很久；同步调用不能留在
+/// 异步线程上，否则会卡住 tokio worker 与用户可见的 check_updates（NFR-4）。
+/// 超时后已阻塞的扫描线程无法取消，但调用方不再等它；失败只记录，不改变整份报告。
+async fn blocking_scan_with_budget<T, F>(
+    per_source: Duration,
+    what: &str,
+    failures: &mut Vec<String>,
+    scan: F,
+) -> Option<T>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    match timeout(per_source, tokio::task::spawn_blocking(scan)).await {
+        Ok(Ok(value)) => Some(value),
+        Ok(Err(e)) => {
+            failures.push(format!("{what}失败：{e}，本项取证未完成"));
+            None
+        }
+        Err(_) => {
+            failures.push(format!(
+                "{what}超时（{} 毫秒），已放弃本项取证",
+                per_source.as_millis()
+            ));
+            None
+        }
+    }
+}
+
 /// 逐来源取证。任何单项失败都只记进 `source_failures`，不影响其它来源（FR-2.5）。
 ///
 /// 只做「列目录 / 读文件 / 看 PATH」：端口调用是只读的 available/installed_version，
-/// 不调用任何写方法，也不启动进程、不改环境。
+/// 文件系统扫描放进 spawn_blocking 并套同一份预算；不调用任何写方法，
+/// 也不启动进程、不改环境。
 async fn probe_sources(
     pm: &dyn PackageManager,
     paths: &OriginPaths,
@@ -300,42 +389,36 @@ async fn probe_sources(
         )),
     }
 
-    facts.launcher = resolve_in(paths.path_dirs.iter().cloned(), "dsh");
-    if let Some(launcher) = &facts.launcher
-        && let Some(dir) = launcher.parent()
+    let path_dirs = paths.path_dirs.clone();
+    if let Some(scan) = blocking_scan_with_budget(
+        per_source,
+        "解析 PATH 中的 dsh 启动器",
+        &mut facts.source_failures,
+        move || scan_launcher(path_dirs),
+    )
+    .await
     {
-        let node_modules = dir.join("node_modules");
-        if node_modules
-            .join(DSH_PACKAGE_NAME)
-            .join("package.json")
-            .is_file()
-        {
-            facts.launcher_node_modules = Some(node_modules);
-        }
+        facts.launcher = scan.launcher;
+        facts.launcher_node_modules = scan.node_modules;
     }
 
-    for root in &paths.installer_roots {
-        if !root.is_dir() {
-            facts
-                .installer_misses
-                .push(format!("{}（目录不存在）", root.display()));
-            continue;
-        }
-        match std::fs::read_dir(root) {
-            Ok(entries) => {
-                for entry in entries.flatten() {
-                    let name = entry.file_name().to_string_lossy().to_string();
-                    if INSTALLER_MARKERS
-                        .iter()
-                        .any(|m| m.eq_ignore_ascii_case(&name))
-                    {
-                        facts.installer_hit = Some(entry.path());
-                    }
-                }
-            }
-            Err(e) => facts
-                .installer_misses
-                .push(format!("{}（无法读取：{e}）", root.display())),
+    if paths.installer_roots.is_empty() {
+        // 被跳过的来源也要记录：for_this_machine 在 LOCALAPPDATA 未设置时得到空候选。
+        facts
+            .source_failures
+            .push("无法定位本机安装器目录（LOCALAPPDATA 未设置），请检查系统环境变量".to_string());
+    } else {
+        let roots = paths.installer_roots.clone();
+        if let Some((hit, misses)) = blocking_scan_with_budget(
+            per_source,
+            "扫描安装器目录",
+            &mut facts.source_failures,
+            move || scan_installer_roots(&roots),
+        )
+        .await
+        {
+            facts.installer_hit = hit;
+            facts.installer_misses = misses;
         }
     }
 
@@ -707,6 +790,89 @@ mod tests {
 
         assert_eq!(report.verdict, OriginVerdict::OfficialInstaller);
         assert!(report.evidences.iter().any(|e| e.path.contains("DSH")));
+    }
+
+    /// 文件系统扫描的结果（PATH 启动器 + 启动器同级包目录）必须照常进入 judge。
+    #[tokio::test]
+    async fn launcher_scan_result_reaches_judge() {
+        let root = temp_dir("origin-launcher-scan");
+        let (bin, global) = npm_global_fixture(&root);
+        let pm = FakePm::new(vec![fake_pm_info(PmKind::Npm, global)]).with_installed(
+            PmKind::Npm,
+            Some(semver::Version::parse("0.2.1-alpha.4").unwrap()),
+        );
+        let paths = OriginPaths {
+            installer_roots: Vec::new(),
+            path_dirs: vec![bin],
+        };
+
+        let report = detect(&pm, &paths, Duration::from_millis(200)).await;
+
+        assert_eq!(report.verdict, OriginVerdict::PackageManager(PmKind::Npm));
+        assert!(
+            report
+                .evidences
+                .iter()
+                .any(|e| e.source == "PATH 中的 dsh 启动器"),
+            "PATH 扫描结果必须进入依据清单：{:?}",
+            report.evidences
+        );
+        assert!(
+            report
+                .evidences
+                .iter()
+                .any(|e| e.source == "启动器同级的包目录"),
+            "启动器同级包目录必须进入依据清单：{:?}",
+            report.evidences
+        );
+    }
+
+    /// 模拟一次卡住的只读扫描：预算到点即放弃，不阻塞调用方（NFR-4）。
+    #[tokio::test]
+    async fn a_slow_filesystem_scan_is_abandoned_by_the_budget() {
+        let mut failures = Vec::new();
+        let started = Instant::now();
+        let scanned = blocking_scan_with_budget(
+            Duration::from_millis(50),
+            "测试用慢扫描",
+            &mut failures,
+            || {
+                std::thread::sleep(Duration::from_millis(600));
+                42_u32
+            },
+        )
+        .await;
+
+        assert_eq!(scanned, None, "超时的扫描不得返回结果");
+        assert!(
+            started.elapsed() < Duration::from_millis(400),
+            "慢扫描必须被预算放弃，不能阻塞调用方"
+        );
+        assert!(
+            failures.iter().any(|f| f.contains("超时")),
+            "被放弃的扫描要记录原因：{failures:?}"
+        );
+    }
+
+    /// 来源被跳过时必须记录原因与下一步：LOCALAPPDATA 未设置的真实形态
+    /// （for_this_machine 得到空的 installer_roots，不能静默略过）。
+    #[tokio::test]
+    async fn skipped_installer_source_is_recorded() {
+        let pm = FakePm::new(Vec::new());
+        let paths = OriginPaths {
+            installer_roots: Vec::new(),
+            path_dirs: Vec::new(),
+        };
+        let report = detect(&pm, &paths, Duration::from_millis(200)).await;
+
+        assert!(
+            report
+                .missing
+                .iter()
+                .any(|m| m.contains("LOCALAPPDATA") && m.contains("环境变量")),
+            "被跳过的安装器来源必须记录原因与下一步：{:?}",
+            report.missing
+        );
     }
 
     /// 裁定 2：gather 要把中间事实完整映射成 M1 消费形状——
