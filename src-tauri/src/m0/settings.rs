@@ -11,6 +11,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::error::{self, AppError, CmdResult};
+use crate::m0::logging::RollPolicy;
+use crate::m0::oplog::{Oplog, OplogEntry};
 
 /// 启动行为（主计划 §3.7，FR-5.2）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -292,6 +294,39 @@ pub fn save(path: &Path, settings: &Settings) -> CmdResult<()> {
         )
         .with_raw(e.to_string())
     })
+}
+
+/// 设置文件损坏时记一条操作记录（§3.7「损坏回落」的可追溯证据）。
+pub fn record_corrupt(
+    oplog: &Oplog,
+    settings_file: &Path,
+    raw: &str,
+    policy: RollPolicy,
+) -> CmdResult<OplogEntry> {
+    let target = settings_file.display().to_string();
+    let entry = OplogEntry::fail("settings.load", &target, error::SETTINGS_CORRUPT, raw);
+    oplog.append(&entry, policy)?;
+    Ok(entry)
+}
+
+/// 设置变更记一条操作记录（旧值 → 新值，设计文档 §7.2「设置的可追溯」）。
+pub fn record_change(
+    oplog: &Oplog,
+    settings_file: &Path,
+    before: &Settings,
+    after: &Settings,
+    policy: RollPolicy,
+) -> CmdResult<OplogEntry> {
+    let raw = format!(
+        "{} → {}",
+        serde_json::to_string(before).unwrap_or_default(),
+        serde_json::to_string(after).unwrap_or_default()
+    );
+    let target = settings_file.display().to_string();
+    let mut entry = OplogEntry::ok("settings.update", &target);
+    entry.raw = Some(raw);
+    oplog.append(&entry, policy)?;
+    Ok(entry)
 }
 
 /// 设置的唯一入口（主计划 §3.3.2 冻结了 `AppState.settings: Arc<SettingsStore>`）。
@@ -676,5 +711,60 @@ mod tests {
         let problem = store.startup_problem().expect("应保留启动时的回落原因");
         assert!(problem.contains("JSON 解析失败"), "实际：{problem}");
         assert_eq!(store.snapshot(), Settings::default());
+    }
+
+    fn policy() -> crate::m0::logging::RollPolicy {
+        crate::m0::logging::RollPolicy {
+            max_bytes: 1024 * 1024,
+            keep_files: 3,
+        }
+    }
+
+    #[test]
+    fn corrupt_load_is_recorded_in_oplog() {
+        let paths = DataPaths::under_root(&temp_root("settings-corrupt-oplog"));
+        paths.ensure_dirs().unwrap();
+        fs::write(paths.settings_file(), "{ 这不是 JSON").unwrap();
+
+        let outcome = load_or_init(&paths.settings_file()).unwrap();
+        let raw = outcome.corrupt.clone().expect("应记录回落原因");
+        let oplog = Oplog::new(paths.oplog_file());
+        let entry = record_corrupt(&oplog, &paths.settings_file(), &raw, policy()).unwrap();
+        assert_eq!(entry.code.as_deref(), Some(error::SETTINGS_CORRUPT));
+        assert_eq!(entry.result, crate::m0::oplog::OplogResult::Fail);
+
+        let page = oplog.read_page(0, 10).unwrap();
+        assert_eq!(page.total, 1);
+        assert_eq!(page.entries[0].code.as_deref(), Some("settings.corrupt"));
+        assert!(
+            page.entries[0]
+                .raw
+                .as_deref()
+                .unwrap()
+                .contains("JSON 解析失败")
+        );
+        // 损坏文件不被覆盖：保留现场，不自动「修复」（NFR-7）
+        assert_eq!(
+            fs::read_to_string(paths.settings_file()).unwrap(),
+            "{ 这不是 JSON"
+        );
+    }
+
+    #[test]
+    fn settings_change_is_recorded_with_before_and_after() {
+        let paths = DataPaths::under_root(&temp_root("settings-change-oplog"));
+        paths.ensure_dirs().unwrap();
+        let before = Settings::default();
+        let mut after = before.clone();
+        apply_patch(&mut after, &serde_json::json!({ "autoChannel": "alpha" }));
+
+        let oplog = Oplog::new(paths.oplog_file());
+        let entry =
+            record_change(&oplog, &paths.settings_file(), &before, &after, policy()).unwrap();
+        assert_eq!(entry.action, "settings.update");
+        assert_eq!(entry.result, crate::m0::oplog::OplogResult::Ok);
+        let raw = entry.raw.expect("应含前后值");
+        assert!(raw.contains("\"alpha\""), "实际：{raw}");
+        assert!(raw.contains("→"));
     }
 }

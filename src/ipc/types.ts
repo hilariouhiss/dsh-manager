@@ -82,3 +82,27 @@ export interface Settings {
 
 /** update_settings 的入参（主计划 §3.4 命令 12）。 */
 export type SettingsPatch = Partial<Settings>;
+
+/** 操作记录结果（主计划 §3.6："ok" | "fail"）。 */
+export type OplogResult = "ok" | "fail";
+
+/** 操作记录实体（主计划 §3.6，对应 Rust 的 m0::oplog::OplogEntry）。 */
+export interface OplogEntry {
+  timestampMs: number;
+  action: string;
+  target: string;
+  result: OplogResult;
+  code: string | null;
+  raw: string | null;
+}
+
+/** list_oplog 的出参（主计划 §3.4 命令 16）。 */
+export interface OplogPage {
+  entries: OplogEntry[];
+  total: number;
+}
+
+/** export_diagnostics 与 export_output 共用的出参（主计划 §3.4 命令 10/15）。 */
+export interface ExportResult {
+  bytesWritten: number;
+}

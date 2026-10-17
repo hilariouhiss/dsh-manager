@@ -6,14 +6,21 @@ use std::sync::Arc;
 
 use tauri::Manager;
 
+use crate::m0::logging;
+use crate::m0::oplog::Oplog;
 use crate::m0::paths::DataPaths;
-use crate::m0::settings::SettingsStore;
+use crate::m0::settings::{self, SettingsStore};
 
-/// 装配点托管的统一状态（T-S1 已按主计划 §3.3.2 冻结形状，本步给出带字段的版本）。
-/// 字段名与顺序冻结：settings / oplog / cancel / registry / package_manager /
-/// process_probe / lister / runner / autostart / paths。
+/// 装配点托管的统一状态。**字段名与顺序按主计划 §3.3.2 冻结**，任何任务都不得改名、
+/// 不得增删已有字段；尚未落地的字段由各自产出任务按下列顺序追加：
+/// 1 `settings: Arc<SettingsStore>`（T-S3）· 2 `oplog: Arc<Oplog>`（T-S5，本条）·
+/// 3 `cancel: Arc<CancelRegistry>`（T-S6）· 4 `registry: Arc<dyn RegistrySource>`（T-V1）·
+/// 5 `package_manager: Arc<dyn PackageManager>`（T-O1）· 6 `process_probe: Arc<dyn ProcessProbe>`（T-I1）·
+/// 7 `lister: Arc<dyn InstanceLister>`（T-I1）· 8 `runner: Arc<InstanceRunner>`（T-I2）·
+/// 9 `autostart: Arc<dyn AutostartPort>`（T-A1）· 10 `paths: DataPaths`（T-S3）。
 pub struct AppState {
     pub settings: Arc<SettingsStore>,
+    pub oplog: Arc<Oplog>,
     pub paths: DataPaths,
 }
 
@@ -29,7 +36,9 @@ pub fn run() {
         .plugin(tauri_plugin_log::Builder::new().build())
         .invoke_handler(tauri::generate_handler![
             ipc::get_settings,
-            ipc::update_settings
+            ipc::update_settings,
+            ipc::list_oplog,
+            ipc::export_diagnostics
         ])
         .setup(|app| {
             let paths = DataPaths::resolve(app.handle())
@@ -39,11 +48,24 @@ pub fn run() {
                 .map_err(|e| format!("{}：{}", e.code, e.reason))?;
             let settings = SettingsStore::load_or_init(paths.settings_file())
                 .map_err(|e| format!("{}：{}", e.code, e.reason))?;
+            let oplog = Oplog::new(paths.oplog_file());
+
+            // 设置损坏：回落默认值 + 记一条操作记录 + 推事件，不阻断启动（§3.7、NFR-7）
             if let Some(raw) = settings.startup_problem() {
                 log::warn!("设置文件存在问题，已回落默认值：{raw}");
+                let entry = settings::record_corrupt(
+                    &oplog,
+                    settings.file(),
+                    raw,
+                    logging::oplog_policy(&settings.snapshot()),
+                )
+                .map_err(|e| format!("{}：{}", e.code, e.reason))?;
+                ipc::emit_oplog(app.handle(), &entry);
             }
+
             app.manage(AppState {
                 settings: Arc::new(settings),
+                oplog: Arc::new(oplog),
                 paths,
             });
             Ok(())
