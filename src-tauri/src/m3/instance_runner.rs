@@ -178,6 +178,8 @@ pub struct InstanceEntry {
     state: Mutex<InstanceState>,
     /// 两个管道读者共用的行锁：seq、时间戳、日志与事件必须同序（修复 2）。
     line_lock: Mutex<()>,
+    /// 本实例的地址提取器：两个读者共用同一份 seen 集合，同一地址只上报一次（§5.3）。
+    extractor: Mutex<crate::m3::url_extract::UrlExtractor>,
     /// 受管登记表的共享句柄：进程退出/停止时自动摘除，供实例枚举按祖先链匹配（修复 1）。
     managed: Arc<Mutex<ManagedRegistry>>,
 }
@@ -218,7 +220,19 @@ impl InstanceEntry {
             // LogWriter::append_line 只收一个字符串：时间戳由我们拼进去（§0.4）。
             let _ = writer.append_line(&format!("[{timestamp_ms}] {text}"));
         }
-        // T-I3 的地址识别接在这里：从 text 里解析出 URL 后调用 emitter.emit_url(...)。
+        // 地址在读流这一刻识别：与本行输出共用同一把行锁，instance:url 先于本行 instance:output（§5.3）。
+        // 两个读者共用本实例的提取器，同一地址出现在 stdout/stderr 上也只上报一次。
+        let found = self
+            .extractor
+            .lock()
+            .expect("地址提取器锁被毒化")
+            .feed(&text);
+        if let Some(url) = found {
+            emitter.emit_url(InstanceUrlPayload {
+                instance_id: self.instance_id.clone(),
+                url,
+            });
+        }
         emitter.emit_output(InstanceOutputPayload {
             instance_id: self.instance_id.clone(),
             seq,
@@ -451,6 +465,7 @@ pub async fn start(
         buffer,
         state: Mutex::new(InstanceState::Starting),
         line_lock: Mutex::new(()),
+        extractor: Mutex::new(crate::m3::url_extract::UrlExtractor::new()),
         managed: runner.managed_registry(),
     });
     runner.insert(entry.clone());
@@ -617,6 +632,10 @@ mod tests {
         fn states(&self) -> Vec<InstanceStatePayload> {
             self.state.lock().unwrap().clone()
         }
+
+        fn urls(&self) -> Vec<InstanceUrlPayload> {
+            self.url.lock().unwrap().clone()
+        }
     }
 
     impl InstanceEmitter for RecordingEmitter {
@@ -732,6 +751,79 @@ mod tests {
         assert!(log.contains("first"), "输出必须同时落盘：{log:?}");
     }
 
+    /// 等子进程跑完输出窗口后，取记录型出口里收到的全部地址（保留重复，交给断言判定）。
+    async fn collect_urls_until_exit(emitter: &Arc<RecordingEmitter>, millis: u64) -> Vec<String> {
+        tokio::time::sleep(Duration::from_millis(millis)).await;
+        emitter.urls().into_iter().map(|p| p.url).collect()
+    }
+
+    /// E2E-4：地址必须从**实时输出**里识别出来，并且同一地址只推一次。
+    /// 需要本机 node，因此默认忽略。
+    #[tokio::test]
+    #[ignore = "需要本机 PATH 中有 node：cargo test -- --ignored 显式运行"]
+    async fn url_event_is_emitted_once_from_live_output() {
+        assert!(node_available(), "本测试需要本机 PATH 中有 node");
+        let dir = temp_dir("url-event");
+        let (runner, emitter) = recording_runner();
+        let probe = FakeProbe::new(Vec::new());
+
+        let spec = build_start_spec(
+            Path::new("node"),
+            &[
+                "-e".to_string(),
+                "console.log('  Web UI: http://127.0.0.1:3080'); console.log('  Web UI: http://127.0.0.1:3080'); setTimeout(() => {}, 1200);"
+                    .to_string(),
+            ],
+            &dir,
+            "inst-url",
+            100,
+            &dir.join("u.log"),
+            1024 * 1024,
+            1,
+        );
+
+        start(&runner, &probe, spec).await.expect("spawn 应当成功");
+
+        let urls = collect_urls_until_exit(&emitter, 1500).await;
+        assert_eq!(
+            urls,
+            vec!["http://127.0.0.1:3080".to_string()],
+            "同一地址只上报一次"
+        );
+    }
+
+    /// 同一地址同时写在 stdout 与 stderr 上，也必须只上报一次。
+    /// 这条用例钉死「两个流共用**同一个**提取器」——各建一个就会报两次（违反 §5.3）。
+    /// 需要本机 node，因此默认忽略。
+    #[tokio::test]
+    #[ignore = "需要本机 PATH 中有 node：cargo test -- --ignored 显式运行"]
+    async fn url_on_both_streams_is_still_reported_once() {
+        assert!(node_available(), "本测试需要本机 PATH 中有 node");
+        let dir = temp_dir("url-event-both-streams");
+        let (runner, emitter) = recording_runner();
+        let probe = FakeProbe::new(Vec::new());
+
+        let spec = build_start_spec(
+            Path::new("node"),
+            &[
+                "-e".to_string(),
+                "console.log('http://127.0.0.1:3080'); console.error('http://127.0.0.1:3080'); setTimeout(() => {}, 1200);"
+                    .to_string(),
+            ],
+            &dir,
+            "inst-url2",
+            100,
+            &dir.join("u2.log"),
+            1024 * 1024,
+            1,
+        );
+
+        start(&runner, &probe, spec).await.expect("spawn 应当成功");
+
+        let urls = collect_urls_until_exit(&emitter, 1500).await;
+        assert_eq!(urls.len(), 1, "两条流上的同一个地址只能上报一次：{urls:?}");
+    }
+
     /// 用真的 .cmd 桩证明「cmd.exe /C 包裹」这条路径通，并且两条管道并发时行管线仍同序。
     /// 桩名不是 dsh，所以不会被插入 web；它自己会睡 2 秒，活过 T-I5 的启动宽限窗口。
     #[tokio::test]
@@ -811,6 +903,7 @@ mod tests {
             buffer: Arc::new(Mutex::new(OutputBuffer::new(1000))),
             state: Mutex::new(InstanceState::Running),
             line_lock: Mutex::new(()),
+            extractor: Mutex::new(crate::m3::url_extract::UrlExtractor::new()),
             managed,
         })
     }

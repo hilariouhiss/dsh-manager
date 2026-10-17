@@ -1,6 +1,7 @@
 pub mod instance_discovery;
 pub mod instance_runner;
 pub mod output_buffer;
+pub mod url_extract;
 
 use serde::Serialize;
 
