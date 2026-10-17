@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "dsh-manager",
+        "title": "DSH 管理器",
         "width": 800,
         "height": 600
       }
