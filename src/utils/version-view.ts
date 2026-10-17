@@ -1,4 +1,5 @@
 import type { ChannelStatus, CheckUpdatesReport, InstallPhase, VersionVerdict } from "../ipc/types";
+import { CHANNEL_OPTIONS } from "../stores/settings";
 
 /** 版本源固定的包名（FR-1.9），与 Rust 侧 m1::channels::PACKAGE_NAME 同值。 */
 export const PACKAGE_NAME = "@deepseek-ai/dsh";
@@ -49,6 +50,19 @@ function formatMs(ms: number | null): string {
 export function versionLabel(version: string | null): string {
   if (version === null) return "未在本机检测到该包";
   return version + "（" + PACKAGE_NAME + " 包）";
+}
+
+const CHANNEL_LABEL = new Map(CHANNEL_OPTIONS.map((channel) => [channel.id, channel.label]));
+
+/** 通道中文名（主计划 §3.8 D-1）；未知 id 原样返回，不编造名字。 */
+export function channelLabel(channel: string): string {
+  return CHANNEL_LABEL.get(channel) ?? channel;
+}
+
+/** 本机版本说明：不适用时不能断言「未在本机检测到该包」，如实说明无法确认。 */
+export function localVersionText(report: CheckUpdatesReport): string {
+  if (!report.versionApplicable) return "无法确认（当前安装方式不在本工具管理范围内）";
+  return versionLabel(report.localVersion);
 }
 
 /** 后端算好的结论 → 界面文案。

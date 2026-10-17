@@ -12,10 +12,11 @@ import {
   CANCEL_UNAVAILABLE_TEXT,
   canCancelInstall,
   channelCards,
+  channelLabel,
   confirmLevel,
+  localVersionText,
   notApplicableText,
   shouldShowInstallConfirm,
-  versionLabel,
   type ChannelCard,
 } from "../utils/version-view";
 
@@ -37,7 +38,7 @@ const notApplicable = computed(() =>
   store.report === null ? null : notApplicableText(store.report),
 );
 const localLabel = computed(() =>
-  store.report === null ? "检查中……" : versionLabel(store.report.localVersion),
+  store.report === null ? "检查中……" : localVersionText(store.report),
 );
 
 onMounted(() => {
@@ -207,7 +208,7 @@ async function cancelInstall(): Promise<void> {
     <article v-for="card in cards" :key="card.channel" class="card bg-base-200">
       <div class="card-body">
         <h2 class="card-title">
-          {{ card.channel }}
+          {{ channelLabel(card.channel) }}
           <span class="badge" :class="card.isError ? 'badge-error' : 'badge-ghost'">
             {{ card.stateText }}
           </span>

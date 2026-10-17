@@ -2,7 +2,9 @@ import { describe, expect, it } from "vite-plus/test";
 import {
   canCancelInstall,
   channelCards,
+  channelLabel,
   conclusionText,
+  localVersionText,
   notApplicableText,
   versionLabel,
 } from "./version-view";
@@ -138,6 +140,38 @@ describe("FR-1.9：版本号标注所属包", () => {
 
   it("本机未安装时如实说明，不猜版本", () => {
     expect(versionLabel(null)).toBe("未在本机检测到该包");
+  });
+});
+
+describe("§3.8：通道卡片显示中文通道名", () => {
+  it("latest/next/alpha 分别显示稳定/预览/先行通道", () => {
+    expect(["latest", "next", "alpha"].map(channelLabel)).toEqual([
+      "稳定通道",
+      "预览通道",
+      "先行通道",
+    ]);
+  });
+
+  it("不认识的通道 id 原样返回，不编造中文名", () => {
+    expect(channelLabel("beta")).toBe("beta");
+  });
+});
+
+describe("本机版本：versionApplicable=false 时如实说明", () => {
+  it("不适用时不声称「未在本机检测到该包」，说明无法确认", () => {
+    const text = localVersionText(
+      report({
+        versionApplicable: false,
+        localVersion: null,
+        notApplicableReason: "无法确认归属。",
+      }),
+    );
+    expect(text).toBe("无法确认（当前安装方式不在本工具管理范围内）");
+    expect(text).not.toContain("未在本机检测到");
+  });
+
+  it("适用时仍显示带包名的本机版本", () => {
+    expect(localVersionText(report())).toBe(versionLabel("0.2.1-alpha.4"));
   });
 });
 
