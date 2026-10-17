@@ -283,7 +283,7 @@ pub fn check_space(req: &InstallRequest) -> CmdResult<()> {
     Ok(())
 }
 
-fn cancelled_error() -> AppError {
+pub(crate) fn cancelled_error() -> AppError {
     AppError::new(
         crate::error::DOWNLOAD_CANCELLED,
         "下载已被取消。",

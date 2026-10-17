@@ -12,13 +12,17 @@ use crate::m0::logging;
 use crate::m0::oplog::{Oplog, OplogEntry, OplogPage};
 use crate::m0::settings::{self, Settings, SettingsStore};
 use crate::m1::channels::{ChannelsCache, by_id};
+use crate::m1::install_runner;
 use crate::m1::installer::{
-    InstallRequest, TaskProgress, available_space_for, download_and_verify,
+    InstallPhase, InstallRequest, TaskProgress, available_space_for, cancelled_error,
+    download_and_verify,
 };
 use crate::m1::version_check::{
     AutoChannelSettings, CheckUpdatesReport, SharedOriginFacts, apply_auto_channel,
     auto_install_notice, check_updates as run_check_updates,
 };
+use crate::m3::instance_discovery::InstanceLister;
+use crate::ports::package_manager::{PackageManager, PmInfo};
 use crate::ports::registry::ChannelProbe;
 
 /// 事件名常量（主计划 §3.5）。前端由 src/ipc/types.ts 的 EVENTS 镜像同名同值。
@@ -227,6 +231,48 @@ pub struct CancelTaskResult {
     pub accepted: bool,
 }
 
+/// 下载校验完成后的安装步骤（T-V6）：运行检测 → 安装 → 复核 → 清理 → 记一条操作记录。
+///
+/// 依赖全部显式传入（临时包、通道/版本、包管理器、实例枚举、操作记录），
+/// 因此不建 Tauri 应用也能单测；事件推送留在命令层，测试不需要假 AppHandle。
+async fn install_after_download(
+    tarball: &Path,
+    target: &str,
+    pms: &[PmInfo],
+    pm: &dyn PackageManager,
+    lister: &dyn InstanceLister,
+    oplog: &Oplog,
+    policy: logging::RollPolicy,
+) -> (CmdResult<install_runner::InstallReport>, OplogEntry) {
+    let result = install_runner::run(tarball, pms, pm, lister).await;
+    let entry = match &result {
+        Ok(report) => {
+            // 安装已完成：清理失败只记日志，不能把一次成功的安装改判为失败（FR-1.6）
+            if let Err(e) = install_runner::cleanup_after_success(report, tarball) {
+                log::warn!("安装成功但清理临时包失败：{}：{}", e.code, e.reason);
+            }
+            let mut entry = OplogEntry::ok("install", target);
+            entry.raw = Some(format!(
+                "installed_before={} -> installed_after={}",
+                report.installed_before.as_deref().unwrap_or("未安装"),
+                report.installed_after.as_deref().unwrap_or("未读到"),
+            ));
+            entry
+        }
+        Err(e) => OplogEntry::fail(
+            "install",
+            target,
+            &e.code,
+            e.raw.clone().unwrap_or_else(|| e.reason.clone()),
+        ),
+    };
+    // 操作记录落盘失败只记日志：用户最关心的是安装本身的结果（FR-1.6）
+    if let Err(e) = oplog.append(&entry, policy) {
+        log::warn!("写入安装操作记录失败：{}：{}", e.code, e.reason);
+    }
+    (result, entry)
+}
+
 /// §3.4 命令 3：开始安装。返回 taskId 后由 `task:progress` 事件推进度。
 ///
 /// 步骤顺序不可颠倒（T-V5 要点）：空间与 HTTPS 检查 → 经端口下载 → 进度 → 校验。
@@ -282,6 +328,8 @@ pub async fn start_install(
 
     let task_id = format!("install-{}", crate::m1::version_check::now_epoch_ms());
     let token = state.cancel.register(&task_id);
+    // 下载要拿走令牌；留一份克隆用于「校验完成、安装开始前」的取消检查（NFR-2）。
+    let pre_install = token.clone();
     let emit_app = app.clone();
     let emit_task = task_id.clone();
     let on_progress = move |p: TaskProgress| {
@@ -295,11 +343,51 @@ pub async fn start_install(
             }),
         );
     };
-    let outcome = download_and_verify(state.registry.as_ref(), &req, token, on_progress).await;
+    let verified =
+        match download_and_verify(state.registry.as_ref(), &req, token, on_progress).await {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                state.cancel.remove(&task_id);
+                return Err(e);
+            }
+        };
+
+    // 安装阶段不可取消：先注销任务，之后 cancel_task 会如实返回 accepted=false（NFR-2）。
+    // 注销后再查令牌，与 CancelRegistry::cancel 的互斥语义一起消除「取消被接受但仍安装」的窗口。
     state.cancel.remove(&task_id);
-    // T-V6 会在这里接过已验证的 outcome 交给 install_runner；本任务只取包与校验。
-    outcome?;
-    Ok(StartInstallResult { task_id })
+    // 下载/校验期间用户取消：不得进入安装；已验证的包按 §3.6 删除（NFR-2）。
+    if pre_install.is_cancelled() {
+        let _ = std::fs::remove_file(&verified.path);
+        return Err(cancelled_error());
+    }
+
+    if let Err(e) = app.emit(
+        EVENT_TASK_PROGRESS,
+        serde_json::json!({
+            "taskId": task_id,
+            "percent": 100,
+            "remainingMs": null,
+            "phase": InstallPhase::Installing.as_str(),
+        }),
+    ) {
+        log::warn!("推送 task:progress（installing）失败：{e}");
+    }
+
+    let pms = state.package_manager.available().await;
+    let policy = logging::oplog_policy(&state.settings.snapshot());
+    let target = format!("{}/{}", req.channel, req.release.version);
+    let (result, entry) = install_after_download(
+        &verified.path,
+        &target,
+        &pms,
+        state.package_manager.as_ref(),
+        state.lister.as_ref(),
+        &state.oplog,
+        policy,
+    )
+    .await;
+    emit_oplog(&app, &entry);
+    result.map(|_report| StartInstallResult { task_id })
 }
 
 /// §3.4 命令 4：取消任务。重复取消安全（NFR-2）。
@@ -313,6 +401,270 @@ pub fn cancel_task(task_id: String, state: State<'_, AppState>) -> CmdResult<Can
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::m0::oplog::OplogResult;
+    use crate::m0::paths::{DataPaths, temp_root};
+    use crate::m3::InstanceState;
+    use crate::m3::instance_discovery::{InstanceInfo, InstanceLister};
+    use crate::ports::package_manager::{InstallOutcome, PackageManager, PmInfo, PmKind};
+    use std::path::PathBuf;
+    use std::sync::Mutex;
+
+    struct FakeLister {
+        running: Vec<InstanceInfo>,
+    }
+
+    impl FakeLister {
+        fn empty() -> Self {
+            Self { running: vec![] }
+        }
+
+        fn with_running(pid: u32) -> Self {
+            Self {
+                running: vec![InstanceInfo {
+                    instance_id: format!("fake-{pid}"),
+                    managed: false,
+                    pid,
+                    started_at_ms: Some(1_760_000_000_000),
+                    uptime_ms: Some(1_000),
+                    url: Some("http://127.0.0.1:3080".to_string()),
+                    state: InstanceState::Running,
+                }],
+            }
+        }
+    }
+
+    impl InstanceLister for FakeLister {
+        fn list_web_instances(&self) -> crate::error::CmdResult<Vec<InstanceInfo>> {
+            Ok(self.running.clone())
+        }
+    }
+
+    struct RecordingPm {
+        versions: Mutex<Vec<Option<semver::Version>>>,
+        install: Mutex<Option<crate::error::CmdResult<InstallOutcome>>>,
+        calls: Mutex<Vec<String>>,
+    }
+
+    impl RecordingPm {
+        fn new(
+            versions: Vec<Option<&str>>,
+            install: crate::error::CmdResult<InstallOutcome>,
+        ) -> Self {
+            Self {
+                versions: Mutex::new(
+                    versions
+                        .into_iter()
+                        .map(|v| v.map(|s| semver::Version::parse(s).unwrap()))
+                        .collect(),
+                ),
+                install: Mutex::new(Some(install)),
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl PackageManager for RecordingPm {
+        async fn available(&self) -> Vec<PmInfo> {
+            vec![pm_info()]
+        }
+
+        async fn installed_version(
+            &self,
+            _pm: &PmInfo,
+        ) -> crate::error::CmdResult<Option<semver::Version>> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push("installed_version".to_string());
+            let mut versions = self.versions.lock().unwrap();
+            Ok(if versions.len() > 1 {
+                versions.remove(0)
+            } else {
+                versions.first().cloned().flatten()
+            })
+        }
+
+        async fn install_from_tarball(
+            &self,
+            _pm: &PmInfo,
+            _tarball: &Path,
+        ) -> crate::error::CmdResult<InstallOutcome> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push("install_from_tarball".to_string());
+            self.install
+                .lock()
+                .unwrap()
+                .take()
+                .expect("安装最多只应被调用一次")
+        }
+    }
+
+    fn pm_info() -> PmInfo {
+        PmInfo {
+            kind: PmKind::Npm,
+            exe: PathBuf::from("C:\\Program Files\\nodejs\\npm.cmd"),
+            version: "11.6.2".to_string(),
+            global_root: PathBuf::from("C:\\Users\\me\\AppData\\Roaming\\npm"),
+        }
+    }
+
+    fn policy() -> logging::RollPolicy {
+        logging::RollPolicy {
+            max_bytes: 1024 * 1024,
+            keep_files: 3,
+        }
+    }
+
+    /// 一次安装的夹具：目录、操作记录与**已校验的**临时包。
+    fn install_fixture(tag: &str, version: &str) -> (DataPaths, Oplog, PathBuf) {
+        let paths = DataPaths::under_root(&temp_root(tag));
+        paths.ensure_dirs().unwrap();
+        let oplog = Oplog::new(paths.oplog_file());
+        let tarball = crate::m1::install_runner::tarball_path(
+            &paths,
+            &semver::Version::parse(version).unwrap(),
+        );
+        std::fs::write(&tarball, b"pretend verified tarball").unwrap();
+        (paths, oplog, tarball)
+    }
+
+    #[tokio::test]
+    async fn failing_install_keeps_the_tarball_and_records_one_failing_oplog_entry() {
+        let (_paths, oplog, tarball) = install_fixture("ipc-install-fail", "0.2.0");
+        let pm = RecordingPm::new(
+            vec![Some("0.2.0-rc.2")],
+            Err(crate::error::AppError::new(
+                crate::error::INSTALL_FAILED,
+                "npm 安装失败。",
+                "按提示手工安装。",
+            )
+            .with_raw("npm ERR! code EACCES\nnpm ERR! permission denied")),
+        );
+        let lister = FakeLister::empty();
+
+        let (result, entry) = install_after_download(
+            &tarball,
+            "latest/0.2.0",
+            &[pm_info()],
+            &pm,
+            &lister,
+            &oplog,
+            policy(),
+        )
+        .await;
+
+        let e = result.unwrap_err();
+        assert_eq!(e.code, crate::error::INSTALL_FAILED);
+        assert!(
+            e.next_step.contains("npm install -g"),
+            "失败必须给出手工安装命令：{}",
+            e.next_step
+        );
+        assert!(tarball.exists(), "安装失败必须保留安装包（FR-1.6）");
+
+        let page = oplog.read_page(0, 10).unwrap();
+        assert_eq!(page.total, 1, "一次安装只记一条操作记录");
+        let logged = &page.entries[0];
+        assert_eq!(logged.action, "install");
+        assert_eq!(logged.target, "latest/0.2.0");
+        assert_eq!(logged.result, OplogResult::Fail);
+        assert_eq!(logged.code.as_deref(), Some(crate::error::INSTALL_FAILED));
+        assert!(
+            logged.raw.as_deref().unwrap_or_default().contains("EACCES"),
+            "raw 必须是安装子进程原文：{:?}",
+            logged.raw
+        );
+        assert_eq!(&entry, logged, "推送的条目就是落盘的那条");
+    }
+
+    #[tokio::test]
+    async fn instances_running_refuses_before_calling_the_package_manager() {
+        let (_paths, oplog, tarball) = install_fixture("ipc-install-running", "0.2.0");
+        let pm = RecordingPm::new(
+            vec![Some("0.2.0-rc.2")],
+            Ok(InstallOutcome {
+                exit_code: 0,
+                output: "added 1 package".to_string(),
+            }),
+        );
+        let lister = FakeLister::with_running(4242);
+
+        let (result, entry) = install_after_download(
+            &tarball,
+            "latest/0.2.0",
+            &[pm_info()],
+            &pm,
+            &lister,
+            &oplog,
+            policy(),
+        )
+        .await;
+
+        let e = result.unwrap_err();
+        assert_eq!(e.code, crate::error::INSTALL_INSTANCES_RUNNING);
+        assert!(e.retryable);
+        assert!(
+            pm.calls().is_empty(),
+            "有实例运行时包管理器一个方法都不该被调用：{:?}",
+            pm.calls()
+        );
+        assert!(tarball.exists(), "被拒时不得删除安装包");
+        let page = oplog.read_page(0, 10).unwrap();
+        assert_eq!(page.total, 1);
+        assert_eq!(page.entries[0].result, OplogResult::Fail);
+        assert_eq!(
+            page.entries[0].code.as_deref(),
+            Some(crate::error::INSTALL_INSTANCES_RUNNING)
+        );
+        assert_eq!(&entry, &page.entries[0]);
+    }
+
+    #[tokio::test]
+    async fn successful_install_cleans_the_tarball_and_records_before_and_after() {
+        let (_paths, oplog, tarball) = install_fixture("ipc-install-ok", "0.2.0");
+        let pm = RecordingPm::new(
+            vec![Some("0.2.0-rc.2"), Some("0.2.1-alpha.4")],
+            Ok(InstallOutcome {
+                exit_code: 0,
+                output: "added 1 package".to_string(),
+            }),
+        );
+        let lister = FakeLister::empty();
+
+        let (result, entry) = install_after_download(
+            &tarball,
+            "latest/0.2.0",
+            &[pm_info()],
+            &pm,
+            &lister,
+            &oplog,
+            policy(),
+        )
+        .await;
+
+        let report = result.expect("安装成功");
+        assert_eq!(report.installed_before.as_deref(), Some("0.2.0-rc.2"));
+        assert_eq!(report.installed_after.as_deref(), Some("0.2.1-alpha.4"));
+        assert!(!tarball.exists(), "成功后临时包必须清理");
+
+        let page = oplog.read_page(0, 10).unwrap();
+        assert_eq!(page.total, 1);
+        assert_eq!(page.entries[0].result, OplogResult::Ok);
+        assert_eq!(page.entries[0].code, None);
+        let raw = page.entries[0].raw.as_deref().expect("成功也要留前后版本");
+        assert!(
+            raw.contains("0.2.0-rc.2") && raw.contains("0.2.1-alpha.4") && raw.contains("->"),
+            "raw 要能看出 installed_before -> installed_after：{raw}"
+        );
+        assert_eq!(&entry, &page.entries[0]);
+    }
 
     #[test]
     fn event_names_match_frozen_contract() {
