@@ -143,3 +143,14 @@ export interface UpdateAvailablePayload {
   version: string;
   needsConfirm: boolean;
 }
+
+/** task:progress 事件里的安装阶段（主计划 §3.5 冻结的四个取值）。 */
+export type InstallPhase = "checking" | "downloading" | "verifying" | "installing";
+
+/** §3.5 事件 task:progress 的载荷（对应 Rust 的 m1::installer::TaskProgress）。 */
+export interface TaskProgressPayload {
+  taskId: string;
+  percent: number;
+  remainingMs: number | null;
+  phase: InstallPhase;
+}

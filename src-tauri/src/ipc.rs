@@ -12,10 +12,14 @@ use crate::m0::logging;
 use crate::m0::oplog::{Oplog, OplogEntry, OplogPage};
 use crate::m0::settings::{self, Settings, SettingsStore};
 use crate::m1::channels::{ChannelsCache, by_id};
+use crate::m1::installer::{
+    InstallRequest, TaskProgress, available_space_for, download_and_verify,
+};
 use crate::m1::version_check::{
     AutoChannelSettings, CheckUpdatesReport, SharedOriginFacts, apply_auto_channel,
     auto_install_notice, check_updates as run_check_updates,
 };
+use crate::ports::registry::ChannelProbe;
 
 /// 事件名常量（主计划 §3.5）。前端由 src/ipc/types.ts 的 EVENTS 镜像同名同值。
 pub const EVENT_TASK_PROGRESS: &str = "task:progress";
@@ -207,6 +211,103 @@ pub async fn check_updates(
         log::warn!("推送 update:available 失败：{e}");
     }
     Ok(report)
+}
+
+/// 命令 3 的出参（主计划 §3.4）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StartInstallResult {
+    pub task_id: String,
+}
+
+/// 命令 4 的出参（主计划 §3.4）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CancelTaskResult {
+    pub accepted: bool,
+}
+
+/// §3.4 命令 3：开始安装。返回 taskId 后由 `task:progress` 事件推进度。
+///
+/// 步骤顺序不可颠倒（T-V5 要点）：空间与 HTTPS 检查 → 经端口下载 → 进度 → 校验。
+/// 下载走 `RegistrySource::download`，**不直接使用 `m0::net::client()`**（§3.3、§7.4 #4）。
+///
+/// 入参扁平为 `{ channel, version }`：§3.4 冻结的是两个顶层键，不是 `{ args: {...} }`。
+#[tauri::command]
+pub async fn start_install(
+    channel: String,
+    version: String,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> CmdResult<StartInstallResult> {
+    let release = match state.registry.probe(&channel).await {
+        ChannelProbe::Published(r) => r,
+        ChannelProbe::Unpublished => {
+            return Err(AppError::new(
+                crate::error::REGISTRY_PARSE,
+                format!("通道 {channel} 当前没有已发布的版本可安装。"),
+                "先点「检查更新」，等该通道发布后再试。",
+            )
+            .retryable(true));
+        }
+        ChannelProbe::Failed(e) => return Err(e),
+    };
+    if release.version.to_string() != version {
+        return Err(AppError::new(
+            crate::error::REGISTRY_PARSE,
+            format!(
+                "通道 {channel} 的最新版本已变为 {}，与请求的 {version} 不一致。",
+                release.version
+            ),
+            "重新点「检查更新」后再发起安装。",
+        )
+        .retryable(true));
+    }
+
+    // §3.6：临时包路径由 DataPaths::tarball 净化产出（作用域包名里的 / 换成 -）
+    let dest = state.paths.tarball(
+        crate::m1::channels::PACKAGE_NAME,
+        &release.version.to_string(),
+    );
+    // 审计重要-10：查的必须是**真正要写入的那个目录**所在的卷
+    let available_bytes = available_space_for(&dest);
+    let req = InstallRequest {
+        channel,
+        release,
+        dest,
+        available_bytes,
+        // 端口不提前回报 Content-Length：解包体积已计入，压缩包字节数未知
+        tarball_bytes: None,
+    };
+
+    let task_id = format!("install-{}", crate::m1::version_check::now_epoch_ms());
+    let token = state.cancel.register(&task_id);
+    let emit_app = app.clone();
+    let emit_task = task_id.clone();
+    let on_progress = move |p: TaskProgress| {
+        let _ = emit_app.emit(
+            EVENT_TASK_PROGRESS,
+            serde_json::json!({
+                "taskId": emit_task,
+                "percent": p.percent,
+                "remainingMs": p.remaining_ms,
+                "phase": p.phase.as_str(),
+            }),
+        );
+    };
+    let outcome = download_and_verify(state.registry.as_ref(), &req, token, on_progress).await;
+    state.cancel.remove(&task_id);
+    // T-V6 会在这里接过已验证的 outcome 交给 install_runner；本任务只取包与校验。
+    outcome?;
+    Ok(StartInstallResult { task_id })
+}
+
+/// §3.4 命令 4：取消任务。重复取消安全（NFR-2）。
+#[tauri::command]
+pub fn cancel_task(task_id: String, state: State<'_, AppState>) -> CmdResult<CancelTaskResult> {
+    Ok(CancelTaskResult {
+        accepted: state.cancel.cancel(&task_id),
+    })
 }
 
 #[cfg(test)]
