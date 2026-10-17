@@ -278,6 +278,8 @@ fn ask_force_or_keep(
 /// 显示并聚焦主窗口；窗口不存在时什么都不做（它由 tauri.conf.json 创建）。
 fn show_main_window(app: &tauri::AppHandle) {
     if let Some(window) = app.get_webview_window(MAIN_WINDOW) {
+        // 托盘点击不激活应用，tao 不会自动还原最小化窗口；先还原再显示聚焦。
+        let _ = window.unminimize();
         let _ = window.show();
         let _ = window.set_focus();
     }
