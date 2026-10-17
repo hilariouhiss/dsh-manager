@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vite-plus/test";
-import { channelCards, conclusionText, notApplicableText, versionLabel } from "./version-view";
+import {
+  canCancelInstall,
+  channelCards,
+  conclusionText,
+  notApplicableText,
+  versionLabel,
+} from "./version-view";
 import type { ChannelStatus, CheckUpdatesReport } from "../ipc/types";
 
 const PACKAGE_NAME = "@deepseek-ai/dsh";
@@ -151,5 +157,56 @@ describe("FR-1.9：versionApplicable=false 时不产出结论", () => {
 
   it("适用时没有不适用说明", () => {
     expect(notApplicableText(report())).toBeNull();
+  });
+});
+
+describe("产品裁定：versionApplicable=false 时不渲染安装入口", () => {
+  it("不适用时不能安装，避免给非 npm 安装再造一份", () => {
+    const cards = channelCards(report({ versionApplicable: false, channels: [channel()] }));
+    expect(cards[0].canInstall).toBe(false);
+  });
+
+  it("适用、已发布且不在安装中才提供安装入口", () => {
+    const r = report({ channels: [channel()] });
+    expect(channelCards(r)[0].canInstall).toBe(true);
+    // 安装进行中不提供第二个安装入口
+    expect(channelCards(r, true)[0].canInstall).toBe(false);
+  });
+});
+
+describe("取消只在真正有效的阶段提供（NFR-2）", () => {
+  it("首个 task:progress 之前 taskId 未知，不可取消", () => {
+    expect(
+      canCancelInstall({ taskId: null, percent: 0, remainingMs: null, phase: "checking" }),
+    ).toBe(false);
+  });
+
+  it("installing 阶段后端已注销任务，不可取消", () => {
+    expect(
+      canCancelInstall({
+        taskId: "install-1",
+        percent: 100,
+        remainingMs: null,
+        phase: "installing",
+      }),
+    ).toBe(false);
+  });
+
+  it("下载/校验阶段可以取消", () => {
+    expect(
+      canCancelInstall({
+        taskId: "install-1",
+        percent: 50,
+        remainingMs: 9000,
+        phase: "downloading",
+      }),
+    ).toBe(true);
+    expect(
+      canCancelInstall({ taskId: "install-1", percent: 90, remainingMs: 1000, phase: "verifying" }),
+    ).toBe(true);
+  });
+
+  it("没有安装在进行时不可取消", () => {
+    expect(canCancelInstall(null)).toBe(false);
   });
 });

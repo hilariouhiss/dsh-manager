@@ -9,6 +9,8 @@ import { isAppError } from "../ipc/client";
 import type { AppError } from "../ipc/types";
 import { useVersionStore } from "../stores/version";
 import {
+  CANCEL_UNAVAILABLE_TEXT,
+  canCancelInstall,
   channelCards,
   confirmLevel,
   notApplicableText,
@@ -24,15 +26,19 @@ const pendingChannel = ref<string | null>(null);
 const pendingInstall = ref<{ channel: string; version: string } | null>(null);
 /** 最近一次安装目标：失败后「重试」按钮要用（自动安装失败时回落到 update:available）。 */
 const lastInstall = ref<{ channel: string; version: string } | null>(null);
+/** cancel_task 不接受时的提示（后端已注销任务的阶段）。 */
+const cancelNotice = ref<string | null>(null);
 
-const cards = computed(() => (store.report === null ? [] : channelCards(store.report)));
+const installing = computed(() => store.installing !== null);
+const cards = computed(() =>
+  store.report === null ? [] : channelCards(store.report, installing.value),
+);
 const notApplicable = computed(() =>
   store.report === null ? null : notApplicableText(store.report),
 );
 const localLabel = computed(() =>
   store.report === null ? "检查中……" : versionLabel(store.report.localVersion),
 );
-const installing = computed(() => store.installing !== null);
 
 onMounted(() => {
   void initialize();
@@ -53,6 +59,11 @@ watch(
   },
 );
 
+// 安装开始或结束时清掉上一轮的「无法取消」提示。
+watch(installing, () => {
+  cancelNotice.value = null;
+});
+
 async function initialize(): Promise<void> {
   try {
     // 订阅先于设置：设置读取失败不应连检查结果一起丢掉（NFR-7）。
@@ -65,7 +76,8 @@ async function initialize(): Promise<void> {
 }
 
 async function loadReport(): Promise<void> {
-  if (refreshing.value) return;
+  // 安装期间不重复拉检查结果：进度与结论以安装结束后的刷新为准。
+  if (refreshing.value || installing.value) return;
   refreshing.value = true;
   try {
     await store.refresh();
@@ -128,7 +140,12 @@ async function confirmInstall(): Promise<void> {
 async function runInstall(target: { channel: string; version: string }): Promise<void> {
   lastInstall.value = target;
   try {
-    await store.startInstall(target.channel, target.version);
+    const taskId = await store.startInstall(target.channel, target.version);
+    if (taskId === null) {
+      // 已有安装在跑：这次重复发起被忽略，不能用它顶掉正在展示的进度/取消目标
+      lastInstall.value = null;
+      return;
+    }
     // 安装成功：清掉重试目标，再刷新一次检查结果（本机版本与结论可能已变化）
     lastInstall.value = null;
     await loadReport();
@@ -148,10 +165,16 @@ function retryInstall(): void {
   }
 }
 
-function cancelInstall(): void {
-  void store.cancelInstall().catch(() => {
+async function cancelInstall(): Promise<void> {
+  cancelNotice.value = null;
+  try {
+    if (!(await store.cancelInstall())) {
+      // taskId 未知或后端已注销任务：如实告诉用户这个阶段取消不了
+      cancelNotice.value = CANCEL_UNAVAILABLE_TEXT;
+    }
+  } catch {
     // 失败已落进 store.installError，页面统一展示
-  });
+  }
 }
 </script>
 
@@ -159,7 +182,7 @@ function cancelInstall(): void {
   <section class="flex flex-col gap-4">
     <header class="flex items-center justify-between">
       <h1 class="text-xl font-bold">版本与更新</h1>
-      <button class="btn btn-sm" :disabled="refreshing" @click="loadReport()">
+      <button class="btn btn-sm" :disabled="refreshing || installing" @click="loadReport()">
         <RefreshCw class="size-4" aria-hidden="true" />
         {{ refreshing ? "正在检查……" : "检查更新" }}
       </button>
@@ -204,7 +227,8 @@ function cancelInstall(): void {
           </div>
         </div>
 
-        <div class="card-actions items-center">
+        <!-- 产品裁定：versionApplicable=false 时不渲染安装入口（含自动安装通道） -->
+        <div v-if="store.report?.versionApplicable" class="card-actions items-center">
           <button
             class="btn btn-sm"
             :disabled="installing || isAutoChannel(card.channel)"
@@ -212,12 +236,7 @@ function cancelInstall(): void {
           >
             {{ isAutoChannel(card.channel) ? "已开启自动安装" : "对该通道自动安装" }}
           </button>
-          <button
-            v-if="card.canInstall"
-            class="btn btn-sm btn-primary"
-            :disabled="installing"
-            @click="onInstall(card)"
-          >
+          <button v-if="card.canInstall" class="btn btn-sm btn-primary" @click="onInstall(card)">
             安装这个版本
           </button>
         </div>
@@ -230,8 +249,13 @@ function cancelInstall(): void {
       :percent="store.installing.percent"
       :remaining-ms="store.installing.remainingMs"
       :phase="store.installing.phase"
+      :cancellable="canCancelInstall(store.installing)"
       @cancel="cancelInstall()"
     />
+
+    <p v-if="cancelNotice !== null" class="text-sm text-warning" role="status">
+      {{ cancelNotice }}
+    </p>
 
     <ErrorAlert
       v-if="store.installError !== null"

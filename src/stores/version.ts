@@ -5,11 +5,11 @@ import {
   EVENTS,
   type AppError,
   type CheckUpdatesReport,
-  type InstallPhase,
   type Settings,
   type TaskProgressPayload,
   type UpdateAvailablePayload,
 } from "../ipc/types";
+import type { InstallingState } from "../utils/version-view";
 
 export interface ChannelToggleRequest {
   needsConfirm: boolean;
@@ -34,12 +34,7 @@ export const useVersionStore = defineStore("version", {
      * 进行中的安装。后端 start_install 在下载+安装全部结束后才返回 taskId，
      * 因此 taskId 先为 null，由首个 task:progress 事件或命令返回补上。
      */
-    installing: null as null | {
-      taskId: string | null;
-      percent: number;
-      remainingMs: number | null;
-      phase: InstallPhase;
-    },
+    installing: null as null | InstallingState,
     /** 最近一次安装/取消失败：界面直接展示原因 + 下一步（NFR-1）。 */
     installError: null as AppError | null,
     /** 事件监听是否已注册：重复挂载不得叠加监听（§3.5 订阅约束）。 */
@@ -91,8 +86,15 @@ export const useVersionStore = defineStore("version", {
       };
     },
 
-    /** 发起安装；进度由 task:progress 事件推进，成功后由调用方刷新结论。 */
-    async startInstall(channel: string, version: string): Promise<string> {
+    /** 发起安装；进度由 task:progress 事件推进，成功后由调用方刷新结论。
+     *
+     *  同一时间只允许一个安装：并发安装会覆盖进度、让取消打到错误的任务上，
+     *  还会在全局范围重复装同一份包。已有安装时直接忽略并返回 null。
+     */
+    async startInstall(channel: string, version: string): Promise<string | null> {
+      if (this.installing !== null) {
+        return null;
+      }
       this.installError = null;
       this.installing = { taskId: null, percent: 0, remainingMs: null, phase: "checking" };
       try {
@@ -155,10 +157,19 @@ export const useVersionStore = defineStore("version", {
       return on<UpdateAvailablePayload>(EVENTS.EVENT_UPDATE_AVAILABLE, (payload) => {
         this.available = payload;
         // needsConfirm=false（用户关闭了安装前确认）时直接进入安装（FR-1.4）。
-        // 失败已落进 installError，自动安装没有可点的发起入口，界面统一展示它。
-        if (!payload.needsConfirm) {
-          void this.startInstall(payload.channel, payload.version).catch(() => {});
+        // 安装进行中不得再起第二个安装。
+        if (payload.needsConfirm || this.installing !== null) {
+          return;
         }
+        void (async () => {
+          try {
+            await this.startInstall(payload.channel, payload.version);
+          } catch {
+            // 失败已落进 installError，自动安装没有可点的发起入口，界面统一展示它。
+          }
+          // 成功时本机版本已变、失败时结论也应保持最新，两条路径都刷新。
+          await this.refresh().catch(() => {});
+        })();
       });
     },
 

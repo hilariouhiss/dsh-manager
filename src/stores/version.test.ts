@@ -280,6 +280,127 @@ describe("version store 的刷新、安装与事件订阅", () => {
     });
   });
 
+  it("自动安装结束后刷新检查结果（成功路径）", async () => {
+    const store = useVersionStore();
+    const report = {
+      channels: [],
+      localVersion: "0.2.1-alpha.4",
+      versionApplicable: true,
+      notApplicableReason: null,
+      lastSuccessAtMs: null,
+      verdicts: {},
+    };
+    invokeCmd.mockImplementation((name: string) => {
+      if (name === "start_install") return Promise.resolve({ taskId: "install-1" });
+      if (name === "check_updates") return Promise.resolve(report);
+      return Promise.resolve({});
+    });
+    await store.listenForUpdates();
+    handlers.get("update:available")?.({
+      channel: "alpha",
+      version: "0.2.1-alpha.4",
+      needsConfirm: false,
+    });
+    await vi.waitFor(() => expect(store.report).toEqual(report));
+    // 先安装、后刷新：自动安装结束后本机版本可能已变，页面不能停留在旧结论。
+    expect(invokeCmd.mock.calls.map((call) => call[0])).toEqual(["start_install", "check_updates"]);
+    expect(store.installing).toBeNull();
+  });
+
+  it("自动安装失败后仍刷新检查结果，失败原因保留给界面", async () => {
+    const store = useVersionStore();
+    const report = {
+      channels: [],
+      localVersion: null,
+      versionApplicable: true,
+      notApplicableReason: null,
+      lastSuccessAtMs: null,
+      verdicts: {},
+    };
+    const failure = {
+      code: ERROR_CODES.INSTALL_FAILED,
+      reason: "安装失败。",
+      nextStep: "重试。",
+      raw: null,
+      retryable: true,
+    };
+    invokeCmd.mockImplementation((name: string) => {
+      if (name === "start_install") return Promise.reject(failure);
+      if (name === "check_updates") return Promise.resolve(report);
+      return Promise.resolve({});
+    });
+    await store.listenForUpdates();
+    handlers.get("update:available")?.({
+      channel: "alpha",
+      version: "0.2.1-alpha.4",
+      needsConfirm: false,
+    });
+    await vi.waitFor(() => expect(store.report).toEqual(report));
+    expect(store.installError).toEqual(failure);
+    expect(store.installing).toBeNull();
+  });
+
+  it("安装进行中再次 startInstall 直接忽略，不调用后端也不覆盖进度", async () => {
+    const store = useVersionStore();
+    let resolveInstall: ((value: { taskId: string }) => void) | undefined;
+    invokeCmd.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          resolveInstall = resolve;
+        }),
+    );
+    const first = store.startInstall("latest", "0.2.0");
+    store.installing = {
+      taskId: "install-1",
+      percent: 50,
+      remainingMs: 1000,
+      phase: "downloading",
+    };
+    await expect(store.startInstall("next", "0.2.1")).resolves.toBeNull();
+    expect(invokeCmd).toHaveBeenCalledTimes(1);
+    expect(store.installing).toEqual({
+      taskId: "install-1",
+      percent: 50,
+      remainingMs: 1000,
+      phase: "downloading",
+    });
+    resolveInstall?.({ taskId: "install-1" });
+    await first;
+  });
+
+  it("安装进行中收到 update:available 不再发起第二个安装", async () => {
+    const store = useVersionStore();
+    await store.listenForUpdates();
+    store.installing = {
+      taskId: "install-1",
+      percent: 50,
+      remainingMs: 1000,
+      phase: "downloading",
+    };
+    handlers.get("update:available")?.({
+      channel: "alpha",
+      version: "0.2.1-alpha.4",
+      needsConfirm: false,
+    });
+    await Promise.resolve();
+    expect(invokeCmd).not.toHaveBeenCalled();
+    expect(store.installing?.taskId).toBe("install-1");
+  });
+
+  it("cancel_task 不接受时返回 false 并保留安装态，界面据此提示无法取消", async () => {
+    const store = useVersionStore();
+    store.installing = {
+      taskId: "install-1",
+      percent: 100,
+      remainingMs: null,
+      phase: "installing",
+    };
+    invokeCmd.mockResolvedValue({ accepted: false });
+    await expect(store.cancelInstall()).resolves.toBe(false);
+    expect(invokeCmd).toHaveBeenCalledWith("cancel_task", { taskId: "install-1" });
+    expect(store.installing).not.toBeNull();
+  });
+
   it("安装失败落进 installError 供界面展示；取消不算失败", async () => {
     const store = useVersionStore();
     const failure = {

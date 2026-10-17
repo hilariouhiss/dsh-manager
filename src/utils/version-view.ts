@@ -1,4 +1,4 @@
-import type { ChannelStatus, CheckUpdatesReport, VersionVerdict } from "../ipc/types";
+import type { ChannelStatus, CheckUpdatesReport, InstallPhase, VersionVerdict } from "../ipc/types";
 
 /** 版本源固定的包名（FR-1.9），与 Rust 侧 m1::channels::PACKAGE_NAME 同值。 */
 export const PACKAGE_NAME = "@deepseek-ai/dsh";
@@ -9,7 +9,7 @@ export interface ChannelCard {
   isError: boolean;
   /** 该通道当前可安装的版本；未发布或从未成功过时为 null。 */
   version: string | null;
-  /** 已发布且已知版本号时才允许发起安装。 */
+  /** 版本适用、已发布、已知版本号且当前没有安装在进行时才允许发起安装。 */
   canInstall: boolean;
   versionText: string;
   publishedText: string | null;
@@ -84,14 +84,20 @@ function lastSuccessTextOf(status: ChannelStatus): string {
   return "上次成功：" + versionLabel(status.version) + "，" + formatMs(status.lastSuccessAtMs);
 }
 
-export function channelCards(report: CheckUpdatesReport): ChannelCard[] {
+export function channelCards(report: CheckUpdatesReport, installing = false): ChannelCard[] {
   return report.channels.map((status) => {
     return {
       channel: status.channel,
       stateText: STATE_TEXT[status.state],
       isError: status.state === "failed",
       version: status.version,
-      canInstall: status.state === "published" && status.version !== null,
+      // 产品裁定：不适用时（官方安装器/便携版/无法识别）不提供 npm 安装入口，
+      // 否则会给本机再造一份 DSH；安装中也只保留一个入口。
+      canInstall:
+        report.versionApplicable &&
+        status.state === "published" &&
+        status.version !== null &&
+        !installing,
       versionText: status.state === "unpublished" ? "尚无可安装版本" : versionLabel(status.version),
       publishedText: formatIso(status.publishedAtIso),
       conclusion: conclusionText(report, status),
@@ -132,4 +138,23 @@ export function confirmLevel(action: ConfirmAction): ConfirmLevel {
 /** 安装前是否还需要用户点一次确认（FR-1.4：该确认可被用户关闭）。 */
 export function shouldShowInstallConfirm(confirmBeforeInstall: boolean): boolean {
   return confirmBeforeInstall;
+}
+
+/** 取消按钮在取消真正无效时的提示（窗口：taskId 未知、已进入安装阶段）。 */
+export const CANCEL_UNAVAILABLE_TEXT = "当前阶段无法取消";
+
+/** 一次进行中的安装（与 store 的 installing 同形；taskId 由首个进度事件补全）。 */
+export interface InstallingState {
+  taskId: string | null;
+  percent: number;
+  remainingMs: number | null;
+  phase: InstallPhase;
+}
+
+/**
+ * 取消只在真正有效的阶段提供：首个 task:progress 之前 taskId 未知；
+ * 进入 installing 阶段后后端已注销任务（cancel_task 只会返回 accepted=false）。
+ */
+export function canCancelInstall(installing: InstallingState | null): boolean {
+  return installing !== null && installing.taskId !== null && installing.phase !== "installing";
 }
