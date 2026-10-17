@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use tauri::Manager;
 
+use crate::m0::cancel::CancelRegistry;
 use crate::m0::logging;
 use crate::m0::oplog::Oplog;
 use crate::m0::paths::DataPaths;
@@ -21,6 +22,7 @@ use crate::m0::settings::{self, SettingsStore};
 pub struct AppState {
     pub settings: Arc<SettingsStore>,
     pub oplog: Arc<Oplog>,
+    pub cancel: Arc<CancelRegistry>,
     pub paths: DataPaths,
 }
 
@@ -66,6 +68,7 @@ pub fn run() {
             app.manage(AppState {
                 settings: Arc::new(settings),
                 oplog: Arc::new(oplog),
+                cancel: Arc::new(CancelRegistry::new()),
                 paths,
             });
             Ok(())
