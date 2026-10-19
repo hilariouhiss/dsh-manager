@@ -1,0 +1,67 @@
+name: Release
+
+# 推送 v1.0.0 形态的 tag 时自动构建 Windows 安装包并发布 Release。
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: 构建并发布 Windows 安装包
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - name: 检出 tag 对应的提交
+        uses: actions/checkout@v4
+
+      - name: 安装 pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 12
+
+      - name: 安装 Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: 安装 Rust 工具链
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: 缓存 Rust 构建产物
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "./src-tauri -> target"
+
+      - name: 安装前端依赖
+        run: pnpm install --frozen-lockfile
+
+      - name: 以 tag 版本号对齐三处清单
+        run: node .github/scripts/set-version.mjs "${{ github.ref_name }}"
+
+      - name: 构建并发布 Release
+        uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: "DSH Manager ${{ github.ref_name }}"
+          releaseDraft: false
+          prerelease: false
+          # 本应用不内置 Tauri updater，不生成 latest.json。
+          uploadUpdaterJson: false
+          releaseBody: |
+            ### 安装
+
+            下载下方附件中的 NSIS 安装程序（`*-setup.exe`，推荐）或 MSI 安装包（`*.msi`），双击安装即可。
+
+            - 支持系统：Windows 10 / Windows 11（WebView2 由系统提供）
+            - 安装包未做代码签名，SmartScreen 提示时选择「更多信息」→「仍要运行」
